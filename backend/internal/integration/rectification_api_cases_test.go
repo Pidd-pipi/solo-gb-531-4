@@ -1,0 +1,557 @@
+package integration
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"hazop-safeguard-coverage/backend/internal/algorithm"
+	"hazop-safeguard-coverage/backend/internal/dto"
+	"hazop-safeguard-coverage/backend/internal/model"
+	"hazop-safeguard-coverage/backend/internal/util"
+)
+
+// generatedChain is the shared fixture state for a scenario with one
+// rectification item ready to be moved through the workflow.
+type generatedChain struct {
+	scenarioID uint
+	itemID     uint
+}
+
+func (f *apiFixture) seedChain(t *testing.T, key string) generatedChain {
+	t.Helper()
+	_, scenario := f.createNodeScenario(t, key)
+	evaluation := f.createCompletedEvaluation(t, key, scenario.ID, "P-"+key,
+		"cause-"+key, "consequence-"+key)
+	item := f.generateItem(t, f.clientFor("engineer"), evaluation.ID, "张工-"+key)
+	return generatedChain{scenarioID: scenario.ID, itemID: item.ID}
+}
+
+func (f *apiFixture) moveToPendingReview(t *testing.T, client *apiClient, id uint) {
+	t.Helper()
+	resp := f.transition(t, client, id, "in_progress", "")
+	resp.expect(t, http.StatusOK, "OK")
+	resp = f.transition(t, client, id, "pending_review", "")
+	resp.expect(t, http.StatusOK, "OK")
+}
+
+func (f *apiFixture) complete(t *testing.T, client *apiClient, id uint, safeguardIDs []uint) apiResponse {
+	t.Helper()
+	return client.do(http.MethodPost, fmt.Sprintf("%s/rectification-items/%d/complete", baseURL, id),
+		map[string]any{"safeguard_ids": safeguardIDs})
+}
+
+// TestRectificationAPIGenerateFlowComplete drives the three main chains
+// (generate -> transition -> complete) through the real router and middleware
+// and asserts the completed item plus its binding are persisted.
+func TestRectificationAPIGenerateFlowComplete(t *testing.T) {
+	f := newAPIFixture(t)
+	chain := f.seedChain(t, "MAIN")
+	engineer := f.clientFor("engineer")
+	reviewer := f.clientFor("reviewer")
+
+	// Chain 1: generate is already done by seedChain; verify the read endpoint
+	// and list/summary return the pending item with the generating user recorded.
+	getResp := engineer.do(http.MethodGet, fmt.Sprintf("%s/rectification-items/%d", baseURL, chain.itemID), nil)
+	getResp.expect(t, http.StatusOK, "OK")
+	var item dto.RectificationItemResponse
+	getResp.decodeData(t, &item)
+	if item.State != "pending" || item.OwnerName != "张工-MAIN" {
+		t.Fatalf("unexpected generated item: %#v", item)
+	}
+	if item.GeneratedBy != f.users["engineer"].ID || item.GeneratedByName != "engineer" {
+		t.Fatalf("generated_by must come from the authenticated engineer: %#v", item)
+	}
+
+	listResp := engineer.do(http.MethodGet,
+		fmt.Sprintf("%s/rectification-items?state=pending", baseURL), nil)
+	listResp.expect(t, http.StatusOK, "OK")
+	var list dto.RectificationListResponse
+	listResp.decodeData(t, &list)
+	if list.Total != 1 || len(list.Items) != 1 || list.Items[0].ID != chain.itemID {
+		t.Fatalf("list should contain the single pending item, got %#v", list)
+	}
+
+	summaryResp := engineer.do(http.MethodGet, baseURL+"/rectification-items/summary", nil)
+	summaryResp.expect(t, http.StatusOK, "OK")
+	var summary dto.RectificationSummaryResponse
+	summaryResp.decodeData(t, &summary)
+	if summary.Total != 1 || summary.Incomplete != 1 || summary.ByState["pending"] != 1 {
+		t.Fatalf("unexpected summary: %#v", summary)
+	}
+
+	// Chain 2: flow pending -> in_progress -> pending_review.
+	f.moveToPendingReview(t, engineer, chain.itemID)
+	moved := f.getItem(t, chain.itemID)
+	if moved.State != "pending_review" {
+		t.Fatalf("item should be pending_review, got %s", moved.State)
+	}
+
+	// Chain 3: complete with a newly added, valid safeguard.
+	// Created strictly after the rectification item so it counts as a new entry.
+	safeguard := f.addSafeguard(t, "main-safeguard", chain.scenarioID, time.Now().Add(time.Minute))
+	completeResp := f.complete(t, reviewer, chain.itemID, []uint{safeguard.ID})
+	completeResp.expect(t, http.StatusOK, "OK")
+	var completed dto.RectificationItemResponse
+	completeResp.decodeData(t, &completed)
+	if completed.State != "completed" {
+		t.Fatalf("expected completed state, got %s", completed.State)
+	}
+	if len(completed.Bindings) != 1 || completed.Bindings[0].SafeguardID != safeguard.ID {
+		t.Fatalf("expected one binding to safeguard %d, got %#v", safeguard.ID, completed.Bindings)
+	}
+	if completed.CompletedBy == nil || *completed.CompletedBy != f.users["reviewer"].ID {
+		t.Fatalf("completed_by must record the authenticated reviewer, got %#v", completed.CompletedBy)
+	}
+
+	// Binding record is durable and points at the now-completed item.
+	stored, err := f.items.FindActiveBindings(context.Background(), []uint{safeguard.ID})
+	if err != nil || len(stored) != 1 || stored[0].ItemID != chain.itemID {
+		t.Fatalf("expected one durable binding on item %d, got %#v (%v)", chain.itemID, stored, err)
+	}
+
+	// A successful HTTP write produces an http_write audit row.
+	var writeAudits int64
+	if err := f.db.Model(&model.AuditLog{}).
+		Where("entity_type = ? AND action = ?", "rectification_items", "http_write").
+		Count(&writeAudits).Error; err != nil {
+		t.Fatalf("count http_write audits: %v", err)
+	}
+	if writeAudits == 0 {
+		t.Fatalf("successful writes must be audited by the HTTP audit middleware")
+	}
+}
+
+// TestRectificationAPIRejectsUnauthenticated covers the missing-token,
+// malformed-token and forged-signature paths. Every protected route must
+// answer 401 UNAUTHORIZED through the real auth middleware and must not create
+// any rectification item.
+func TestRectificationAPIRejectsUnauthenticated(t *testing.T) {
+	f := newAPIFixture(t)
+	chain := f.seedChain(t, "AUTH")
+	f.moveToPendingReview(t, f.clientFor("engineer"), chain.itemID)
+	safeguard := f.addSafeguard(t, "auth-safeguard", chain.scenarioID, time.Now().Add(time.Minute))
+
+	anon := f.anonClient()
+	paths := []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodGet, baseURL + "/rectification-items", nil},
+		{http.MethodGet, fmt.Sprintf("%s/rectification-items/%d", baseURL, chain.itemID), nil},
+		{http.MethodPost, baseURL + "/rectification-items/generate", map[string]any{"evaluation_id": 1}},
+		{http.MethodPost, fmt.Sprintf("%s/rectification-items/%d/transition", baseURL, chain.itemID),
+			map[string]any{"to_state": "in_progress"}},
+		{http.MethodPost, fmt.Sprintf("%s/rectification-items/%d/complete", baseURL, chain.itemID),
+			map[string]any{"safeguard_ids": []uint{safeguard.ID}}},
+	}
+	for _, tc := range paths {
+		resp := anon.do(tc.method, tc.path, tc.body)
+		if resp.StatusCode != http.StatusUnauthorized || resp.Envelope.Code != string(util.CodeUnauthorized) {
+			t.Fatalf("%s %s without token: expected 401 UNAUTHORIZED, got %d %s",
+				tc.method, tc.path, resp.StatusCode, resp.Envelope.Code)
+		}
+	}
+
+	// A garbage bearer value and a token signed with the wrong secret are also
+	// rejected at the authentication layer, before RBAC runs.
+	garbage := &apiClient{fixture: f, token: "not-a-jwt"}
+	resp := garbage.do(http.MethodPost, fmt.Sprintf("%s/rectification-items/%d/complete", baseURL, chain.itemID),
+		map[string]any{"safeguard_ids": []uint{safeguard.ID}})
+	resp.expect(t, http.StatusUnauthorized, util.CodeUnauthorized)
+
+	forged := &apiClient{fixture: f, token: f.forgedToken()}
+	resp = forged.do(http.MethodPost, baseURL+"/rectification-items/generate", map[string]any{"evaluation_id": 1})
+	resp.expect(t, http.StatusUnauthorized, util.CodeUnauthorized)
+
+	// No item was generated by the unauthorized generate calls.
+	if f.getItem(t, chain.itemID).State != "pending_review" {
+		t.Fatalf("unauthorized requests must not change item state")
+	}
+	if f.bindingCount(t, safeguard.ID) != 0 {
+		t.Fatalf("unauthorized complete must not create a binding")
+	}
+	var itemCount int64
+	if err := f.db.Model(&model.RectificationItem{}).Count(&itemCount).Error; err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if itemCount != 1 {
+		t.Fatalf("unauthorized generate must not create items, found %d", itemCount)
+	}
+}
+
+// TestRectificationAPIRejectsWrongRole verifies the RBAC middleware returns
+// 403 FORBIDDEN for role/action mismatches without touching the record.
+func TestRectificationAPIRejectsWrongRole(t *testing.T) {
+	f := newAPIFixture(t)
+	chain := f.seedChain(t, "RBAC")
+	f.moveToPendingReview(t, f.clientFor("engineer"), chain.itemID)
+	safeguard := f.addSafeguard(t, "rbac-safeguard", chain.scenarioID, time.Now().Add(time.Minute))
+	before := f.getItem(t, chain.itemID)
+
+	// A safety reviewer lacks rectification:write and may not generate items.
+	resp := f.clientFor("reviewer").do(http.MethodPost, baseURL+"/rectification-items/generate",
+		map[string]any{"evaluation_id": 1})
+	resp.expect(t, http.StatusForbidden, util.CodeForbidden)
+
+	// A process engineer lacks rectification:review and may not complete an item.
+	resp = f.clientFor("engineer").do(http.MethodPost,
+		fmt.Sprintf("%s/rectification-items/%d/complete", baseURL, chain.itemID),
+		map[string]any{"safeguard_ids": []uint{safeguard.ID}})
+	resp.expect(t, http.StatusForbidden, util.CodeForbidden)
+
+	// The read-only auditor can read but cannot transition.
+	resp = f.clientFor("auditor").do(http.MethodGet, fmt.Sprintf("%s/rectification-items/%d", baseURL, chain.itemID), nil)
+	resp.expect(t, http.StatusOK, "OK")
+	resp = f.clientFor("auditor").do(http.MethodPost,
+		fmt.Sprintf("%s/rectification-items/%d/transition", baseURL, chain.itemID),
+		map[string]any{"to_state": "voided", "reason": "auditor attempt"})
+	resp.expect(t, http.StatusForbidden, util.CodeForbidden)
+
+	// Nothing changed and no binding was created by the forbidden writes.
+	f.assertItemUntouched(t, chain.itemID, before)
+	if f.bindingCount(t, safeguard.ID) != 0 {
+		t.Fatalf("forbidden complete must not create a binding")
+	}
+}
+
+// TestRectificationAPIRejectsIllegalTransition covers state-machine violations
+// surfaced both by request binding (unknown target state -> 400) and by the
+// service transition table (valid enum, impossible move -> 409).
+func TestRectificationAPIRejectsIllegalTransition(t *testing.T) {
+	f := newAPIFixture(t)
+	chain := f.seedChain(t, "FLOW")
+	engineer := f.clientFor("engineer")
+	before := f.getItem(t, chain.itemID)
+
+	// pending -> completed is not in the oneof set, so binding rejects it first.
+	resp := f.transition(t, engineer, chain.itemID, "completed", "")
+	resp.expect(t, http.StatusBadRequest, util.CodeValidation)
+
+	// pending -> pending_review is a syntactically valid enum but skips
+	// in_progress, so the state machine rejects it.
+	resp = f.transition(t, engineer, chain.itemID, "pending_review", "")
+	resp.expect(t, http.StatusConflict, util.CodeStateTransition)
+
+	// voiding requires a reason; the state machine path enforces the 422.
+	resp = f.transition(t, engineer, chain.itemID, "voided", "x")
+	resp.expect(t, http.StatusUnprocessableEntity, util.CodeValidation)
+
+	// A legal move forward then completes; once completed no further
+	// transition is possible.
+	f.moveToPendingReview(t, engineer, chain.itemID)
+	safeguard := f.addSafeguard(t, "flow-safeguard", chain.scenarioID, time.Now().Add(time.Minute))
+	completeResp := f.complete(t, f.clientFor("reviewer"), chain.itemID, []uint{safeguard.ID})
+	completeResp.expect(t, http.StatusOK, "OK")
+
+	resp = f.transition(t, engineer, chain.itemID, "in_progress", "")
+	resp.expect(t, http.StatusConflict, util.CodeStateTransition)
+
+	// The failed early transitions left the original pending record untouched;
+	// after the legal completion the item and its single binding stay intact.
+	finished := f.getItem(t, chain.itemID)
+	if finished.State != "completed" || len(finished.Bindings) != 1 {
+		t.Fatalf("item should be completed with one binding, got state=%s bindings=%d",
+			finished.State, len(finished.Bindings))
+	}
+	if before.State != "pending" {
+		t.Fatalf("sanity: record should have started pending, got %s", before.State)
+	}
+}
+
+// TestRectificationAPICompleteRequiresBinding covers the missing-binding gate:
+// completion from pending_review must bind at least one newly added, valid
+// safeguard belonging to the same scenario.
+func TestRectificationAPICompleteRequiresBinding(t *testing.T) {
+	f := newAPIFixture(t)
+	chain := f.seedChain(t, "BIND")
+	engineer := f.clientFor("engineer")
+	reviewer := f.clientFor("reviewer")
+	f.moveToPendingReview(t, engineer, chain.itemID)
+	before := f.getItem(t, chain.itemID)
+
+	// No safeguard ids at all.
+	resp := f.complete(t, reviewer, chain.itemID, []uint{})
+	resp.expect(t, http.StatusUnprocessableEntity, util.CodeSafeguardBinding)
+
+	// An explicit empty array serialised the same way must also be rejected.
+	resp = reviewer.do(http.MethodPost,
+		fmt.Sprintf("%s/rectification-items/%d/complete", baseURL, chain.itemID),
+		map[string]any{"safeguard_ids": []uint{}})
+	resp.expect(t, http.StatusUnprocessableEntity, util.CodeSafeguardBinding)
+
+	// A safeguard that belongs to a different scenario cannot close this item.
+	_, otherScenario := f.createNodeScenario(t, "BINDOTHER")
+	foreign := f.addSafeguard(t, "foreign-safeguard", otherScenario.ID, time.Now().Add(time.Minute))
+	resp = f.complete(t, reviewer, chain.itemID, []uint{foreign.ID})
+	resp.expect(t, http.StatusUnprocessableEntity, util.CodeSafeguardBinding)
+
+	// A safeguard created before the rectification item is not "newly added".
+	old := f.addSafeguard(t, "too-old-safeguard", chain.scenarioID, before.CreatedAt.Add(-time.Minute))
+	resp = f.complete(t, reviewer, chain.itemID, []uint{old.ID})
+	resp.expect(t, http.StatusUnprocessableEntity, util.CodeSafeguardBinding)
+
+	// Completing from the wrong source state (item currently pending_review is
+	// moved back to in_progress first) is a state conflict, not a binding error.
+	returnResp := reviewer.do(http.MethodPost,
+		fmt.Sprintf("%s/rectification-items/%d/return", baseURL, chain.itemID),
+		map[string]any{"reason": "please add more evidence"})
+	returnResp.expect(t, http.StatusOK, "OK")
+	afterReturn := f.getItem(t, chain.itemID)
+	valid := f.addSafeguard(t, "bind-valid-safeguard", chain.scenarioID, time.Now().Add(time.Minute))
+	resp = f.complete(t, reviewer, chain.itemID, []uint{valid.ID})
+	resp.expect(t, http.StatusConflict, util.CodeStateTransition)
+
+	// All rejected attempts must leave the item un-completed and without any
+	// binding rows; the state after the legal return must be preserved.
+	after := f.getItem(t, chain.itemID)
+	if after.State == "completed" {
+		t.Fatalf("item must not be completed after rejected attempts")
+	}
+	for _, sg := range []uint{foreign.ID, old.ID, valid.ID} {
+		if f.bindingCount(t, sg) != 0 {
+			t.Fatalf("rejected completion must not bind safeguard %d", sg)
+		}
+	}
+	f.assertItemUntouched(t, chain.itemID, afterReturn)
+}
+
+// TestRectificationAPIDuplicateBindingRejected first closes one item with a
+// safeguard, then proves the same safeguard cannot close a second item, and
+// cannot be re-bound to the already completed item. The completed item and its
+// original binding remain exactly as they were.
+func TestRectificationAPIDuplicateBindingRejected(t *testing.T) {
+	f := newAPIFixture(t)
+	first := f.seedChain(t, "DUP1")
+	// A second chain in the same scenario so both items may legally use the
+	// same safeguard from a domain-rule perspective.
+	evaluation2 := f.createCompletedEvaluation(t, "DUP1B", first.scenarioID, "P-DUP1B",
+		"cause-dup-2", "consequence-dup-2")
+	secondItem := f.generateItem(t, f.clientFor("engineer"), evaluation2.ID, "张工-DUP2")
+
+	engineer := f.clientFor("engineer")
+	reviewer := f.clientFor("reviewer")
+	f.moveToPendingReview(t, engineer, first.itemID)
+	f.moveToPendingReview(t, engineer, secondItem.ID)
+
+	shared := f.addSafeguard(t, "shared-safeguard", first.scenarioID, time.Now().Add(time.Minute))
+	firstResp := f.complete(t, reviewer, first.itemID, []uint{shared.ID})
+	firstResp.expect(t, http.StatusOK, "OK")
+	firstAfter := f.getItem(t, first.itemID)
+	if firstAfter.State != "completed" || len(firstAfter.Bindings) != 1 {
+		t.Fatalf("first item should be completed with the shared safeguard")
+	}
+
+	// Reusing the already-bound safeguard on the second item must fail 409.
+	secondBefore := f.getItem(t, secondItem.ID)
+	resp := f.complete(t, reviewer, secondItem.ID, []uint{shared.ID})
+	resp.expect(t, http.StatusConflict, util.CodeSafeguardBound)
+
+	// The error names the item the safeguard already closed.
+	if want := fmt.Sprintf("整改项 #%d", first.itemID); !strings.Contains(resp.Envelope.Message, want) {
+		t.Fatalf("error message should reference %s, got %q", want, resp.Envelope.Message)
+	}
+	f.assertItemUntouched(t, secondItem.ID, secondBefore)
+
+	// Re-completing the already completed item (with a fresh safeguard) is a
+	// state conflict, and the completed record must keep its original binding.
+	another := f.addSafeguard(t, "another-safeguard", first.scenarioID, time.Now().Add(2*time.Minute))
+	resp = f.complete(t, reviewer, first.itemID, []uint{another.ID})
+	resp.expect(t, http.StatusConflict, util.CodeStateTransition)
+
+	final := f.getItem(t, first.itemID)
+	if final.State != "completed" || len(final.Bindings) != 1 || final.Bindings[0].SafeguardID != shared.ID {
+		t.Fatalf("completed item must retain only the original binding, got state=%s bindings=%#v",
+			final.State, final.Bindings)
+	}
+	if f.bindingCount(t, another.ID) != 0 {
+		t.Fatalf("the fresh safeguard must never be bound after the rejected re-complete")
+	}
+}
+
+// TestRectificationAPIConcurrentBindingRace fires two completion requests for
+// two different pending-review items against the same safeguard. Exactly one
+// may win: one 200 + one binding + one completed item.
+func TestRectificationAPIConcurrentBindingRace(t *testing.T) {
+	f := newAPIFixture(t)
+	first := f.seedChain(t, "RACE1")
+	evaluation2 := f.createCompletedEvaluation(t, "RACE2", first.scenarioID, "P-RACE2",
+		"cause-race-2", "consequence-race-2")
+	secondItem := f.generateItem(t, f.clientFor("engineer"), evaluation2.ID, "张工-RACE2")
+	engineer := f.clientFor("engineer")
+	f.moveToPendingReview(t, engineer, first.itemID)
+	f.moveToPendingReview(t, engineer, secondItem.ID)
+	safeguard := f.addSafeguard(t, "raced-safeguard", first.scenarioID, time.Now().Add(time.Minute))
+
+	results := f.raceCompletions(t, []uint{first.itemID, secondItem.ID}, safeguard.ID)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(results))
+	}
+	successes, conflicts := 0, 0
+	for _, result := range results {
+		switch {
+		case result.StatusCode == http.StatusOK && result.Envelope.Code == "OK":
+			successes++
+		case result.StatusCode == http.StatusConflict &&
+			(result.Envelope.Code == string(util.CodeSafeguardBound) ||
+				result.Envelope.Code == string(util.CodeStateTransition)):
+			conflicts++
+		default:
+			t.Fatalf("unexpected race outcome: %d %s (%s)",
+				result.StatusCode, result.Envelope.Code, result.Envelope.Message)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("exactly one request may succeed, got %d success and %d conflict", successes, conflicts)
+	}
+
+	bindings, err := f.items.FindActiveBindings(context.Background(), []uint{safeguard.ID})
+	if err != nil {
+		t.Fatalf("load bindings: %v", err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("exactly one binding row may exist, got %d", len(bindings))
+	}
+	completed := 0
+	for _, id := range []uint{first.itemID, secondItem.ID} {
+		if f.getItem(t, id).State == "completed" {
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("exactly one item may be completed, got %d", completed)
+	}
+	if f.getItem(t, bindings[0].ItemID).State != "completed" {
+		t.Fatalf("the binding must belong to the completed item %d", bindings[0].ItemID)
+	}
+}
+
+// TestRectificationAPIConcurrentBindingRaceRepeated reruns the race across
+// independent rounds so the unique-index guarantee is exercised repeatedly
+// rather than passing on a single scheduling outcome.
+func TestRectificationAPIConcurrentBindingRaceRepeated(t *testing.T) {
+	const rounds = 5
+	for round := 0; round < rounds; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			f := newAPIFixture(t)
+			key := fmt.Sprintf("RR%d", round)
+			first := f.seedChain(t, key)
+			evaluation2 := f.createCompletedEvaluation(t, key+"B", first.scenarioID, "P-"+key+"B",
+				"cause-"+key+"-2", "consequence-"+key+"-2")
+			secondItem := f.generateItem(t, f.clientFor("engineer"), evaluation2.ID, "张工-"+key+"2")
+			engineer := f.clientFor("engineer")
+			f.moveToPendingReview(t, engineer, first.itemID)
+			f.moveToPendingReview(t, engineer, secondItem.ID)
+			safeguard := f.addSafeguard(t, "raced-"+key, first.scenarioID, time.Now().Add(time.Minute))
+
+			results := f.raceCompletions(t, []uint{first.itemID, secondItem.ID}, safeguard.ID)
+			successes := 0
+			for _, result := range results {
+				if result.StatusCode == http.StatusOK {
+					successes++
+				} else if result.StatusCode != http.StatusConflict {
+					t.Fatalf("round %d: unexpected status %d %s",
+						round, result.StatusCode, result.Envelope.Code)
+				}
+			}
+			if successes != 1 {
+				t.Fatalf("round %d: exactly one winner required, got %d", round, successes)
+			}
+			if count := f.bindingCount(t, safeguard.ID); count != 1 {
+				t.Fatalf("round %d: exactly one binding required, got %d", round, count)
+			}
+		})
+	}
+}
+
+func (f *apiFixture) raceCompletions(t *testing.T, itemIDs []uint, safeguardID uint) []apiResponse {
+	t.Helper()
+	// Warm the shared token cache on the originating goroutine so concurrent
+	// requests only read it (avoids racing the tokens map under -race).
+	reviewerToken := f.login("reviewer")
+	var wg sync.WaitGroup
+	results := make([]apiResponse, len(itemIDs))
+	start := make(chan struct{})
+	for i, id := range itemIDs {
+		wg.Add(1)
+		go func(index int, itemID uint) {
+			defer wg.Done()
+			client := &apiClient{fixture: f, token: reviewerToken}
+			<-start
+			results[index] = f.complete(t, client, itemID, []uint{safeguardID})
+		}(i, id)
+	}
+	close(start)
+	wg.Wait()
+	return results
+}
+
+// TestRectificationAPIGenerateIdempotentOnRepost ensures a repeated generate
+// against the same completed evaluation reports the existing item as skipped
+// rather than creating a duplicate through the HTTP layer.
+func TestRectificationAPIGenerateIdempotentOnRepost(t *testing.T) {
+	f := newAPIFixture(t)
+	chain := f.seedChain(t, "IDEM")
+	evaluation, err := f.evaluations.GetByID(context.Background(),
+		f.getItem(t, chain.itemID).EvaluationID)
+	if err != nil {
+		t.Fatalf("load evaluation: %v", err)
+	}
+	resp := f.clientFor("engineer").do(http.MethodPost,
+		baseURL+"/rectification-items/generate",
+		map[string]any{"evaluation_id": evaluation.ID})
+	resp.expect(t, http.StatusCreated, "OK")
+	var generated dto.GenerateRectificationResponse
+	resp.decodeData(t, &generated)
+	if len(generated.Created) != 0 || len(generated.Skipped) != 1 {
+		t.Fatalf("repost must create 0 and skip 1, got %d created %d skipped",
+			len(generated.Created), len(generated.Skipped))
+	}
+	if generated.Skipped[0].ExistingItemID != chain.itemID {
+		t.Fatalf("skipped entry must reference item %d, got %d",
+			chain.itemID, generated.Skipped[0].ExistingItemID)
+	}
+	var count int64
+	if err := f.db.Model(&model.RectificationItem{}).Count(&count).Error; err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("repost must not create a second item, found %d", count)
+	}
+}
+
+// TestRectificationAPIGenerateFromNonCompletedEvaluation confirms the HTTP
+// layer surfaces the 409 CONFLICT business error when the source evaluation is
+// not in a generatable state.
+func TestRectificationAPIGenerateFromNonCompletedEvaluation(t *testing.T) {
+	f := newAPIFixture(t)
+	_, scenario := f.createNodeScenario(t, "QUEUED")
+	now := time.Now().UTC()
+	queued := model.CoverageEvaluation{
+		ScenarioID: scenario.ID, AlgorithmVersion: algorithm.Version,
+		InputSnapshot: "{}", InputHash: util.HashString("queued-eval"),
+		UncoveredPaths: "[]", DeduplicatedSafeguards: "[]",
+		RiskRankBefore: "high", RiskRankAfter: "high",
+		EvaluationState: "queued", Explanation: "{}",
+		EvaluatedBy: f.users["engineer"].ID, EvaluatedByName: "engineer", EvaluatedAt: now,
+		IdempotencyKey: "idem-queued", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := f.evaluations.Create(context.Background(), &queued); err != nil {
+		t.Fatalf("create queued evaluation: %v", err)
+	}
+	resp := f.clientFor("engineer").do(http.MethodPost,
+		baseURL+"/rectification-items/generate", map[string]any{"evaluation_id": queued.ID})
+	resp.expect(t, http.StatusConflict, util.CodeConflict)
+	var count int64
+	if err := f.db.Model(&model.RectificationItem{}).Count(&count).Error; err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("no item may be generated from a queued evaluation, found %d", count)
+	}
+}
