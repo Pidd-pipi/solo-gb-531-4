@@ -30,8 +30,8 @@ func (RectificationItem) TableName() string { return "rectification_items" }
 
 type RectificationBinding struct {
 	ID            uint      `gorm:"primaryKey" json:"id"`
-	ItemID        uint      `gorm:"not null;uniqueIndex:idx_rectification_binding_pair" json:"item_id"`
-	SafeguardID   uint      `gorm:"not null;uniqueIndex:idx_rectification_binding_pair;index" json:"safeguard_id"`
+	ItemID        uint      `gorm:"not null;index" json:"item_id"`
+	SafeguardID   uint      `gorm:"not null;uniqueIndex" json:"safeguard_id"`
 	SafeguardName string    `gorm:"size:180;not null" json:"safeguard_name"`
 	BoundBy       uint      `gorm:"not null" json:"bound_by"`
 	BoundByName   string    `gorm:"size:80;not null" json:"bound_by_name"`

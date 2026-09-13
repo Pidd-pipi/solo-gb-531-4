@@ -17,6 +17,7 @@ type RectificationItemRepository interface {
 	Update(context.Context, uint, map[string]any) error
 	Transition(context.Context, uint, []string, string, map[string]any) (bool, error)
 	CreateBinding(context.Context, *model.RectificationBinding) error
+	FindActiveBindings(context.Context, []uint) ([]model.RectificationBinding, error)
 	CountByState(context.Context) (map[string]int64, error)
 	WithTx(context.Context, func(RectificationItemRepository) error) error
 }
@@ -122,6 +123,21 @@ func (r *rectificationItemRepository) CreateBinding(ctx context.Context, binding
 		return fmt.Errorf("create rectification binding: %w", err)
 	}
 	return nil
+}
+
+func (r *rectificationItemRepository) FindActiveBindings(ctx context.Context, safeguardIDs []uint) ([]model.RectificationBinding, error) {
+	if len(safeguardIDs) == 0 {
+		return nil, nil
+	}
+	var bindings []model.RectificationBinding
+	if err := r.db.WithContext(ctx).Model(&model.RectificationBinding{}).
+		Joins("JOIN rectification_items ON rectification_items.id = rectification_bindings.item_id").
+		Where("rectification_bindings.safeguard_id IN ?", safeguardIDs).
+		Where("rectification_items.state != ?", "voided").
+		Find(&bindings).Error; err != nil {
+		return nil, fmt.Errorf("find active bindings for safeguards: %w", err)
+	}
+	return bindings, nil
 }
 
 func (r *rectificationItemRepository) CountByState(ctx context.Context) (map[string]int64, error) {

@@ -85,7 +85,7 @@ pending -> in_progress -> pending_review -> completed
                     +-> in_progress (复核退回)
 ```
 
-`pending_review -> completed` 必须绑定至少一条**新补录且当前有效**的保护层（属于同一偏差场景、生命周期有效且验证未过期、登记时间晚于整改项创建时间），否则返回 `422 SAFEGUARD_BINDING_REQUIRED`。非法迁移返回 `409 INVALID_STATE_TRANSITION`。整改项以缺口指纹（场景 + 原因 + 后果）去重，同一缺口重复生成会被拦截并在响应 `skipped` 中说明；作废覆盖评估不会清除已生成的整改项。生成、编辑与作废需要 `rectification:write`（管理员、工艺工程师），完成复核与退回需要 `rectification:review`（管理员、安全复核员）。
+`pending_review -> completed` 必须绑定至少一条**新补录且当前有效**的保护层（属于同一偏差场景、生命周期有效且验证未过期、登记时间晚于整改项创建时间），否则返回 `422 SAFEGUARD_BINDING_REQUIRED`。同一保护层只能用于关闭一个整改项：已绑定到未作废整改项的保护层再次提交返回 `409 SAFEGUARD_ALREADY_BOUND` 并指明它已关闭的整改项；绑定表对保护层列有唯一索引，并发完成请求只有一个成功，已完成记录由条件迁移保护不可改写。非法迁移返回 `409 INVALID_STATE_TRANSITION`。整改项以缺口指纹（场景 + 原因 + 后果）去重，同一缺口重复生成会被拦截并在响应 `skipped` 中说明；作废覆盖评估不会清除已生成的整改项。生成、编辑与作废需要 `rectification:write`（管理员、工艺工程师），完成复核与退回需要 `rectification:review`（管理员、安全复核员）。
 
 ## 共享枚举位置
 

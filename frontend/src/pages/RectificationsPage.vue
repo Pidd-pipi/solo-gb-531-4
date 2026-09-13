@@ -41,11 +41,13 @@ const scenarioLabel = (id: number) => { const item = scenarios.items.find((x) =>
 const eligibleEvaluations = computed(() => evaluations.items.filter((x) => ['completed', 'confirmed'].includes(x.evaluation_state) && (x.uncovered_paths?.length ?? 0) > 0))
 const evaluationLabel = (id?: number) => { const item = evaluations.items.find((x) => x.id === id); return item ? `评估 #${item.id} · ${scenarioLabel(item.scenario_id)} · ${item.uncovered_paths.length} 条缺口` : '选择已完成的评估' }
 
+const boundSafeguardIds = computed(() => new Set(store.items.flatMap((x) => (x.bindings ?? []).map((b) => b.safeguard_id))))
 function eligibleSafeguards(item: RectificationItem): Safeguard[] {
   const createdAt = new Date(item.created_at).getTime()
   return safeguards.items.filter((x) => x.target_scenario_id === item.scenario_id
     && x.lifecycle_state === 'active' && !x.verification_expired
-    && x.created_at && new Date(x.created_at).getTime() > createdAt)
+    && x.created_at && new Date(x.created_at).getTime() > createdAt
+    && !boundSafeguardIds.value.has(x.id))
 }
 function fmtDate(value?: string | null) { return value ? new Date(value).toLocaleDateString('zh-CN') : '未设置' }
 

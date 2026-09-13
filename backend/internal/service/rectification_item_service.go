@@ -315,6 +315,19 @@ func (s *rectificationItemService) Complete(
 		}
 		safeguards = append(safeguards, safeguard)
 	}
+	bound, err := s.items.FindActiveBindings(ctx, request.SafeguardIDs)
+	if err != nil {
+		return dto.RectificationItemResponse{}, util.WrapError(http.StatusInternalServerError, util.CodeInternal, "unable to check existing safeguard bindings", err)
+	}
+	for _, binding := range bound {
+		if binding.ItemID == id {
+			continue
+		}
+		return dto.RectificationItemResponse{}, util.NewError(
+			http.StatusConflict, util.CodeSafeguardBound,
+			fmt.Sprintf("保护层 #%d 已用于关闭整改项 #%d，不能重复绑定", binding.SafeguardID, binding.ItemID),
+		)
+	}
 	completedAt := now
 	err = s.items.WithTx(ctx, func(tx repository.RectificationItemRepository) error {
 		for _, safeguard := range safeguards {
@@ -324,7 +337,13 @@ func (s *rectificationItemService) Complete(
 			}
 			if err := tx.CreateBinding(ctx, &binding); err != nil {
 				if uniqueViolation(err) {
-					return util.NewError(http.StatusConflict, util.CodeConflict, fmt.Sprintf("保护层 #%d 已绑定到该整改项", safeguard.ID))
+					conflicts, findErr := tx.FindActiveBindings(ctx, []uint{safeguard.ID})
+					if findErr == nil && len(conflicts) > 0 {
+						return util.NewError(http.StatusConflict, util.CodeSafeguardBound,
+							fmt.Sprintf("保护层 #%d 已用于关闭整改项 #%d，不能重复绑定", safeguard.ID, conflicts[0].ItemID))
+					}
+					return util.NewError(http.StatusConflict, util.CodeSafeguardBound,
+						fmt.Sprintf("保护层 #%d 已绑定到其他整改项，不能重复绑定", safeguard.ID))
 				}
 				return util.WrapError(http.StatusInternalServerError, util.CodeInternal, "unable to bind safeguard", err)
 			}

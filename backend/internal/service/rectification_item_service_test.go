@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +107,41 @@ func (f rectificationFixture) addSafeguard(t *testing.T, name string, scenarioID
 		t.Fatalf("create safeguard %s: %v", name, err)
 	}
 	return safeguard
+}
+
+func (f rectificationFixture) generateSecond(t *testing.T) dto.RectificationItemResponse {
+	t.Helper()
+	uncovered := `[{"path_id":"P-2","node_code":"R-201","cause":"cooling failure","consequence":"runaway reaction","safeguard_ids":[],"independence_keys":[],"combined_protection":0,"covered":false,"reason":"no effective safeguard"}]`
+	evaluation := model.CoverageEvaluation{
+		ScenarioID: f.scenario.ID, AlgorithmVersion: algorithm.Version,
+		InputSnapshot: "{}", InputHash: util.HashString("rectification-test-2"),
+		CoverageScore: 0, UncoveredPaths: uncovered, DeduplicatedSafeguards: "[]",
+		RiskRankBefore: "high", RiskRankAfter: "high",
+		EvaluationState: "completed", Explanation: "{}",
+		EvaluatedBy: 10, EvaluatedByName: "engineer", EvaluatedAt: time.Now().UTC(),
+		IdempotencyKey: "rectification-test-key-2", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := f.evaluations.Create(context.Background(), &evaluation); err != nil {
+		t.Fatalf("create second evaluation: %v", err)
+	}
+	result, err := f.service.Generate(context.Background(), dto.GenerateRectificationRequest{EvaluationID: evaluation.ID}, f.engineer)
+	if err != nil {
+		t.Fatalf("generate second rectification item: %v", err)
+	}
+	if len(result.Created) != 1 {
+		t.Fatalf("expected 1 created item, got %d", len(result.Created))
+	}
+	return result.Created[0]
+}
+
+func (f rectificationFixture) toPendingReview(t *testing.T, id uint) {
+	t.Helper()
+	if _, err := f.service.Transition(context.Background(), id, dto.TransitionRectificationRequest{ToState: "in_progress"}, f.engineer); err != nil {
+		t.Fatalf("start rectification %d: %v", id, err)
+	}
+	if _, err := f.service.Transition(context.Background(), id, dto.TransitionRectificationRequest{ToState: "pending_review"}, f.engineer); err != nil {
+		t.Fatalf("submit rectification %d for review: %v", id, err)
+	}
 }
 
 func TestRectificationGenerateAndDuplicateBlocked(t *testing.T) {
@@ -291,5 +328,122 @@ func TestRectificationItemsSurviveEvaluationVoid(t *testing.T) {
 	}
 	if summary.Total != 1 {
 		t.Fatalf("evaluation void must not clear rectification items: %#v", summary)
+	}
+}
+
+func TestRectificationSafeguardCannotCloseTwoItems(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	ctx := context.Background()
+	first := fixture.generateOne(t)
+	second := fixture.generateSecond(t)
+	fixture.toPendingReview(t, first.ID)
+	fixture.toPendingReview(t, second.ID)
+	verified := time.Now().UTC().Add(-24 * time.Hour)
+	safeguard := fixture.addSafeguard(t, "shared-safeguard", fixture.scenario.ID, time.Now().UTC().Add(time.Minute), &verified, "active")
+	completed, err := fixture.service.Complete(ctx, first.ID, dto.CompleteRectificationRequest{SafeguardIDs: []uint{safeguard.ID}}, fixture.reviewer)
+	if err != nil || completed.State != "completed" {
+		t.Fatalf("first completion should succeed: %v", err)
+	}
+	_, err = fixture.service.Complete(ctx, second.ID, dto.CompleteRectificationRequest{SafeguardIDs: []uint{safeguard.ID}}, fixture.reviewer)
+	var appErr *util.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 409 || appErr.Code != util.CodeSafeguardBound {
+		t.Fatalf("reusing a bound safeguard should return 409 SAFEGUARD_ALREADY_BOUND, got %v", err)
+	}
+	if !strings.Contains(appErr.Message, fmt.Sprintf("整改项 #%d", first.ID)) {
+		t.Fatalf("error should name the item the safeguard already closed, got %q", appErr.Message)
+	}
+	reloaded, err := fixture.service.Get(ctx, second.ID)
+	if err != nil || reloaded.State != "pending_review" {
+		t.Fatalf("rejected completion must not change state, got %v (%v)", reloaded.State, err)
+	}
+}
+
+func TestRectificationCompleteConcurrency(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	sqlDB, err := fixture.db.DB()
+	if err != nil {
+		t.Fatalf("raw db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	ctx := context.Background()
+	first := fixture.generateOne(t)
+	second := fixture.generateSecond(t)
+	fixture.toPendingReview(t, first.ID)
+	fixture.toPendingReview(t, second.ID)
+	verified := time.Now().UTC().Add(-24 * time.Hour)
+	safeguard := fixture.addSafeguard(t, "raced-safeguard", fixture.scenario.ID, time.Now().UTC().Add(time.Minute), &verified, "active")
+	const attempts = 8
+	results := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		itemID := first.ID
+		if i%2 == 1 {
+			itemID = second.ID
+		}
+		go func(id uint) {
+			_, err := fixture.service.Complete(ctx, id, dto.CompleteRectificationRequest{SafeguardIDs: []uint{safeguard.ID}}, fixture.reviewer)
+			results <- err
+		}(itemID)
+	}
+	succeeded := 0
+	for i := 0; i < attempts; i++ {
+		if err := <-results; err == nil {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("exactly one concurrent completion may succeed, got %d", succeeded)
+	}
+	bindings, err := fixture.items.FindActiveBindings(ctx, []uint{safeguard.ID})
+	if err != nil || len(bindings) != 1 {
+		t.Fatalf("exactly one binding may exist, got %d (%v)", len(bindings), err)
+	}
+	states := map[uint]string{}
+	for _, id := range []uint{first.ID, second.ID} {
+		item, err := fixture.service.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("reload item %d: %v", id, err)
+		}
+		states[id] = item.State
+	}
+	completed := 0
+	for _, state := range states {
+		if state == "completed" {
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("exactly one item may be completed, got %v", states)
+	}
+	if states[bindings[0].ItemID] != "completed" {
+		t.Fatalf("binding must belong to the completed item, got %v", states)
+	}
+}
+
+func TestRectificationCompletedRecordImmutable(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	ctx := context.Background()
+	item := fixture.generateOne(t)
+	fixture.toPendingReview(t, item.ID)
+	verified := time.Now().UTC().Add(-24 * time.Hour)
+	safeguard := fixture.addSafeguard(t, "immutable-check", fixture.scenario.ID, time.Now().UTC().Add(time.Minute), &verified, "active")
+	completed, err := fixture.service.Complete(ctx, item.ID, dto.CompleteRectificationRequest{SafeguardIDs: []uint{safeguard.ID}}, fixture.reviewer)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	other := fixture.addSafeguard(t, "immutable-other", fixture.scenario.ID, time.Now().UTC().Add(2*time.Minute), &verified, "active")
+	_, err = fixture.service.Complete(ctx, item.ID, dto.CompleteRectificationRequest{SafeguardIDs: []uint{other.ID}}, fixture.reviewer)
+	var appErr *util.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 409 {
+		t.Fatalf("re-completing a completed item should return 409, got %v", err)
+	}
+	reloaded, err := fixture.service.Get(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.State != "completed" || len(reloaded.Bindings) != 1 || reloaded.Bindings[0].SafeguardID != safeguard.ID {
+		t.Fatalf("completed record must not be rewritten: %#v", reloaded)
+	}
+	if reloaded.CompletedBy == nil || *reloaded.CompletedBy != *completed.CompletedBy || !reloaded.CompletedAt.Equal(*completed.CompletedAt) {
+		t.Fatalf("completed_by/at must stay unchanged: %#v vs %#v", reloaded.CompletedBy, completed.CompletedBy)
 	}
 }
