@@ -48,3 +48,31 @@ func TestCoverageTransitions(t *testing.T) {
 		}
 	}
 }
+
+func TestRectificationTransitions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		from, to RectificationState
+		allowed  bool
+	}{
+		{RectificationPending, RectificationInProgress, true},
+		{RectificationPending, RectificationVoided, true},
+		{RectificationInProgress, RectificationPendingReview, true},
+		{RectificationInProgress, RectificationVoided, true},
+		{RectificationPendingReview, RectificationCompleted, true},
+		{RectificationPendingReview, RectificationInProgress, true},
+		{RectificationPendingReview, RectificationVoided, true},
+		{RectificationPending, RectificationCompleted, false},
+		{RectificationPending, RectificationPendingReview, false},
+		{RectificationInProgress, RectificationCompleted, false},
+		{RectificationInProgress, RectificationPending, false},
+		{RectificationCompleted, RectificationInProgress, false},
+		{RectificationCompleted, RectificationVoided, false},
+		{RectificationVoided, RectificationPending, false},
+	}
+	for _, test := range tests {
+		if actual := CanTransitionRectification(test.from, test.to); actual != test.allowed {
+			t.Errorf("%s -> %s: got %t, want %t", test.from, test.to, actual, test.allowed)
+		}
+	}
+}

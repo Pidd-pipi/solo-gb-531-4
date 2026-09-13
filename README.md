@@ -35,6 +35,7 @@ docker compose up -d --build
 - 偏差分析：使用 `no/more/less/reverse/other` 引导词记录参数、原因、后果和 5×5 风险矩阵，按受约束状态机完成多人复核。
 - 保护层台账：记录保护类型、目标场景、独立性键、有效性、测试间隔、最近验证时间与证据说明；过期或重复保护层不会被错误重复计分。
 - 覆盖推演：冻结输入，构建原因到后果路径，找出未保护路径，按独立性键去重并保存评分步骤、输入哈希与算法版本。
+- 整改台账：把评估的未保护缺口转为可跟进整改项，按场景汇总并记录责任人、截止日期与证据说明；完成复核必须绑定新补录且有效的保护层，同一缺口重复生成会被拦截，作废评估不清除历史整改项。
 - 审计中心：按实体、操作者、request ID 和时间筛选写操作；展示变更前后快照及算法运行摘要。
 - 横切能力：JWT、RBAC、登录与算法限流、request ID、统一业务错误、panic recovery、事务状态迁移、幂等评估与结构化日志。
 
@@ -74,6 +75,18 @@ queued -> running -> completed -> confirmed
 
 运行接口要求 `Idempotency-Key`。同一调用者复用相同键时返回已有评估，不重复插入结果；历史快照禁止覆盖。
 
+### 整改状态
+
+```text
+pending -> in_progress -> pending_review -> completed
+   |          |                |
+   +-> voided <+---------------+
+                    |
+                    +-> in_progress (复核退回)
+```
+
+`pending_review -> completed` 必须绑定至少一条**新补录且当前有效**的保护层（属于同一偏差场景、生命周期有效且验证未过期、登记时间晚于整改项创建时间），否则返回 `422 SAFEGUARD_BINDING_REQUIRED`。非法迁移返回 `409 INVALID_STATE_TRANSITION`。整改项以缺口指纹（场景 + 原因 + 后果）去重，同一缺口重复生成会被拦截并在响应 `skipped` 中说明；作废覆盖评估不会清除已生成的整改项。生成、编辑与作废需要 `rectification:write`（管理员、工艺工程师），完成复核与退回需要 `rectification:review`（管理员、安全复核员）。
+
 ## 共享枚举位置
 
 `DeviationGuideword = no | more | less | reverse | other`
@@ -94,6 +107,14 @@ queued -> running -> completed -> confirmed
 
 前后端枚举值完全一致；展示文案只存在于前端标签映射，API 和数据库始终传递英文枚举值。
 
+`RectificationState = pending | in_progress | pending_review | completed | voided`
+
+- 后端定义：`backend/internal/constants/rectification_state.go`
+- 数据校验：`backend/internal/model/rectification_item.go`、`backend/internal/dto/rectification_item.go`
+- 状态机与测试：`backend/internal/service/rectification_item_service.go` 及对应 `_test.go`
+- 前端定义：`frontend/src/types/enums/rectification-state.ts`
+- 前端消费：`types/rectification.ts`、`api/rectification.ts`、`stores/rectification.ts`、`utils/rectification.ts`、`pages/RectificationsPage.vue`
+
 ## 页面与共享前端模块
 
 | 页面 | 实体消费 | 主要动作 |
@@ -102,7 +123,8 @@ queued -> running -> completed -> confirmed
 | `/deviations` | `DeviationScenario + ProcessNode + Safeguard` | 编辑原因后果、风险分级、合法状态迁移 |
 | `/safeguards` | `Safeguard + DeviationScenario` | 登记、更新、失效/恢复、检查独立性与有效期 |
 | `/coverage` | `CoverageEvaluation + DeviationScenario + Safeguard` | 幂等运行、轮询、路径解释、版本对比、确认/作废 |
-| `/audit` | 四个实体的审计投影 | 筛选 request ID、查看前后快照与算法元数据 |
+| `/rectifications` | `RectificationItem + CoverageEvaluation + Safeguard` | 从评估生成、按状态分组、编辑责任人与截止日期、绑定保护层完成复核 |
+| `/audit` | 五个实体的审计投影 | 筛选 request ID、查看前后快照与算法元数据 |
 
 `RiskBadge` 由节点、偏差和覆盖页共用；`ScenarioStateTimeline` 由偏差和覆盖页共用；`EvidenceDrawer` 由保护层、覆盖和审计页共用。`useAuth` 统一会话与权限，`useCoverageRun` 统一幂等键、轮询和离开页面后的过期请求取消。
 
@@ -129,6 +151,14 @@ queued -> running -> completed -> confirmed
 | `POST` | `/api/v1/coverage-evaluations/:id/replay` | 从快照确定性重放并比较 |
 | `POST` | `/api/v1/coverage-evaluations/:id/confirm` | 人工确认 |
 | `POST` | `/api/v1/coverage-evaluations/:id/void` | 作废评估 |
+| `GET` | `/api/v1/rectification-items` | 整改项列表（按场景/状态过滤） |
+| `GET` | `/api/v1/rectification-items/summary` | 按状态统计与未完成数量 |
+| `GET` | `/api/v1/rectification-items/:id` | 整改项详情（含已绑定保护层） |
+| `POST` | `/api/v1/rectification-items/generate` | 从已完成/已确认评估的缺口生成整改项，重复缺口被拦截 |
+| `PUT` | `/api/v1/rectification-items/:id` | 编辑责任人、截止日期与证据说明（终态拒绝） |
+| `POST` | `/api/v1/rectification-items/:id/transition` | 整改状态迁移（开始整改/提交复核/作废） |
+| `POST` | `/api/v1/rectification-items/:id/complete` | 绑定新补录有效保护层并完成复核 |
+| `POST` | `/api/v1/rectification-items/:id/return` | 复核退回到整改中 |
 | `GET` | `/api/v1/audit-logs` | 只读审计查询 |
 | `GET` | `/healthz` | 无认证真实健康检查 |
 
@@ -155,7 +185,7 @@ queued -> running -> completed -> confirmed
 └── runtime_smoke.json
 ```
 
-后端遵循 `router -> handler -> service -> repository -> model` 单向依赖和构造器注入。handler 不直接访问 GORM。四个实体在 model、dto、repository、service、handler 和 router 中分别独立成文件；前端 type、api、store 与 page 同样独立。
+后端遵循 `router -> handler -> service -> repository -> model` 单向依赖和构造器注入。handler 不直接访问 GORM。五个实体在 model、dto、repository、service、handler 和 router 中分别独立成文件；前端 type、api、store 与 page 同样独立。
 
 ## 技术栈
 

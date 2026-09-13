@@ -11,6 +11,7 @@ const router = createRouter({
     { path: '/deviations', name: 'deviations', component: () => import('../pages/DeviationsPage.vue') },
     { path: '/safeguards', name: 'safeguards', component: () => import('../pages/SafeguardsPage.vue') },
     { path: '/coverage', name: 'coverage', component: () => import('../pages/CoveragePage.vue') },
+    { path: '/rectifications', name: 'rectifications', component: () => import('../pages/RectificationsPage.vue') },
     { path: '/audit', name: 'audit', component: () => import('../pages/AuditPage.vue'), meta: { roles: ['admin', 'safety_reviewer', 'auditor'] } },
     { path: '/:pathMatch(.*)*', redirect: '/nodes' },
   ],

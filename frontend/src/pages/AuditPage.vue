@@ -14,7 +14,7 @@ const drawer = ref(false)
 const selected = ref<AuditLog>()
 const filters = reactive<AuditFilters>({ entity_type: '', actor_id: '', request_id: '', from: '', to: '' })
 const counts = computed(() => store.items.reduce<Record<string, number>>((acc, item) => { acc[item.entity_type] = (acc[item.entity_type] ?? 0) + 1; return acc }, {}))
-const entityLabels: Record<string, string> = { process_node: '工艺节点', deviation_scenario: '偏差场景', safeguard: '保护层', coverage_evaluation: '覆盖评估' }
+const entityLabels: Record<string, string> = { process_node: '工艺节点', deviation_scenario: '偏差场景', safeguard: '保护层', coverage_evaluation: '覆盖评估', rectification_item: '整改项' }
 async function refresh() { try { await store.load(filters) } catch (error) { ElMessage.error(errorMessage(error)) } }
 function inspect(item: AuditLog) { selected.value = item; drawer.value = true }
 function snapshot(value: unknown) { if (typeof value !== 'string') return value ?? {}; try { return JSON.parse(value) } catch { return value } }
@@ -26,7 +26,7 @@ onMounted(refresh)
     <PageHeader eyebrow="IMMUTABLE CHANGE JOURNAL" title="审计中心" description="按实体、操作者、request ID 与时间追溯四类核心实体的写操作和算法运行证据。">
       <el-button :loading="store.loading" @click="refresh"><RefreshCw :size="16" />刷新</el-button>
     </PageHeader>
-    <section class="audit-metrics"><div v-for="entity in ['process_node','deviation_scenario','safeguard','coverage_evaluation']" :key="entity"><span>{{ entityLabels[entity] }}</span><strong>{{ counts[entity] ?? 0 }}</strong></div></section>
+    <section class="audit-metrics"><div v-for="entity in ['process_node','deviation_scenario','safeguard','coverage_evaluation','rectification_item']" :key="entity"><span>{{ entityLabels[entity] }}</span><strong>{{ counts[entity] ?? 0 }}</strong></div></section>
     <section class="audit-tools">
       <div class="audit-search"><Search :size="16" /><el-input v-model="filters.request_id" placeholder="request ID" clearable /><el-input v-model="filters.actor_id" placeholder="操作者 ID" clearable /></div>
       <div class="audit-search"><el-select v-model="filters.entity_type" placeholder="全部实体" clearable><el-option v-for="(label, value) in entityLabels" :key="value" :label="label" :value="value" /></el-select><el-date-picker v-model="filters.from" type="datetime" placeholder="起始时间" value-format="YYYY-MM-DDTHH:mm:ssZ" /><el-date-picker v-model="filters.to" type="datetime" placeholder="结束时间" value-format="YYYY-MM-DDTHH:mm:ssZ" /><el-button type="primary" @click="refresh">筛选</el-button></div>

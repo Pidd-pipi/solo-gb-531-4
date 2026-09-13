@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Boxes, ClipboardCheck, FileSearch, LogOut, Network, ShieldCheck } from 'lucide-vue-next'
+import { Boxes, ClipboardCheck, ClipboardList, FileSearch, LogOut, Network, ShieldCheck } from 'lucide-vue-next'
 import { useAuthStore } from '../../stores/auth'
 import SafetyBoundary from './SafetyBoundary.vue'
 
@@ -12,6 +12,7 @@ const links = [
   { to: '/deviations', label: '偏差分析', icon: FileSearch },
   { to: '/safeguards', label: '保护层台账', icon: ShieldCheck },
   { to: '/coverage', label: '覆盖推演', icon: Network },
+  { to: '/rectifications', label: '整改台账', icon: ClipboardList },
   { to: '/audit', label: '审计中心', icon: ClipboardCheck, roles: ['admin', 'safety_reviewer', 'auditor'] },
 ]
 const visibleLinks = computed(() => links.filter((link) => !link.roles || (auth.role && link.roles.includes(auth.role))))

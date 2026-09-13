@@ -14,6 +14,7 @@ export interface Safeguard {
   evidence_note: string
   verification_expires_at?: string
   verification_expired?: boolean
+  created_at?: string
   target_scenario?: { id: number; parameter: string; scenario_state: string }
 }
 

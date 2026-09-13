@@ -63,6 +63,8 @@ func migrate(db *gorm.DB) error {
 		&model.DeviationScenario{},
 		&model.Safeguard{},
 		&model.CoverageEvaluation{},
+		&model.RectificationItem{},
+		&model.RectificationBinding{},
 		&model.AuditLog{},
 	)
 	if err != nil {
