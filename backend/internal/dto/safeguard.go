@@ -1,33 +1,38 @@
 package dto
+
 import (
 	"hazop-safeguard-coverage/backend/internal/model"
 	"strings"
 	"time"
 )
+
 type CreateSafeguardRequest struct {
 	Name             string     `json:"name" binding:"required,min=2,max=180"`
 	SafeguardType    string     `json:"safeguard_type" binding:"required,oneof=alarm interlock relief procedural containment detection"`
 	TargetScenarioID uint       `json:"target_scenario_id" binding:"required"`
-	IndependenceKey  string     `json:"independence_key" binding:"required,min=2,max=100"`
+	IndependenceKey  string     `json:"independence_key" binding:"omitempty,max=100"`
 	Effectiveness    float64    `json:"effectiveness" binding:"required,gt=0,lte=1"`
 	TestIntervalDays int        `json:"test_interval_days" binding:"required,min=1,max=3650"`
 	LastVerifiedAt   *time.Time `json:"last_verified_at"`
 	EvidenceNote     string     `json:"evidence_note" binding:"required,min=3,max=4000"`
 }
+
 func (r *CreateSafeguardRequest) Normalize() {
 	r.Name = strings.TrimSpace(r.Name)
 	r.SafeguardType = strings.ToLower(strings.TrimSpace(r.SafeguardType))
 	r.IndependenceKey = strings.ToUpper(strings.TrimSpace(r.IndependenceKey))
 	r.EvidenceNote = strings.TrimSpace(r.EvidenceNote)
 }
+
 type UpdateSafeguardRequest struct {
 	Name             *string  `json:"name" binding:"omitempty,min=2,max=180"`
 	SafeguardType    *string  `json:"safeguard_type" binding:"omitempty,oneof=alarm interlock relief procedural containment detection"`
-	IndependenceKey  *string  `json:"independence_key" binding:"omitempty,min=2,max=100"`
+	IndependenceKey  *string  `json:"independence_key" binding:"omitempty,max=100"`
 	Effectiveness    *float64 `json:"effectiveness" binding:"omitempty,gt=0,lte=1"`
 	TestIntervalDays *int     `json:"test_interval_days" binding:"omitempty,min=1,max=3650"`
 	EvidenceNote     *string  `json:"evidence_note" binding:"omitempty,min=3,max=4000"`
 }
+
 func (r *UpdateSafeguardRequest) Normalize() {
 	r.Name = trimPointer(r.Name)
 	if r.SafeguardType != nil {
@@ -40,6 +45,7 @@ func (r *UpdateSafeguardRequest) Normalize() {
 	}
 	r.EvidenceNote = trimPointer(r.EvidenceNote)
 }
+
 type VerifySafeguardRequest struct {
 	VerifiedAt   time.Time `json:"verified_at" binding:"required"`
 	EvidenceNote string    `json:"evidence_note" binding:"required,min=3,max=4000"`
@@ -79,6 +85,7 @@ type SafeguardListResponse struct {
 	Page  int                 `json:"page"`
 	Size  int                 `json:"page_size"`
 }
+
 func NewSafeguardResponse(s model.Safeguard, now time.Time) SafeguardResponse {
 	expires := s.VerificationExpiresAt()
 	expired := expires == nil || now.After(*expires)

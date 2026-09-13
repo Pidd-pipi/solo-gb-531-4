@@ -577,3 +577,60 @@ func (f rectificationFixture) getItemRecord(t *testing.T, id uint) model.Rectifi
 	}
 	return item
 }
+
+// addKeylessSafeguard stores an otherwise-valid active safeguard whose
+// independence key is blank, simulating a ledger record that slipped through
+// before validation existed.
+func (f rectificationFixture) addKeylessSafeguard(t *testing.T, scenarioID uint, createdAt time.Time) model.Safeguard {
+	t.Helper()
+	verified := time.Now().UTC().Add(-24 * time.Hour)
+	safeguard := model.Safeguard{
+		Name: "keyless-safeguard", SafeguardType: "interlock", TargetScenarioID: scenarioID,
+		IndependenceKey: "   ", Effectiveness: 0.8, TestIntervalDays: 365,
+		LastVerifiedAt: &verified, LifecycleState: "active", EvidenceNote: "missing key",
+		CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+	if err := f.safeguards.Create(context.Background(), &safeguard); err != nil {
+		t.Fatalf("create keyless safeguard: %v", err)
+	}
+	return safeguard
+}
+
+func TestRectificationCompleteRejectsSafeguardWithoutIndependenceKey(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	ctx := context.Background()
+	item := fixture.generateOne(t)
+	fixture.toPendingReview(t, item.ID)
+	keyless := fixture.addKeylessSafeguard(t, fixture.scenario.ID, time.Now().UTC().Add(time.Minute))
+	before := fixture.getItemRecord(t, item.ID)
+
+	_, err := fixture.service.Complete(ctx, item.ID,
+		dto.CompleteRectificationRequest{SafeguardIDs: []uint{keyless.ID}}, fixture.reviewer)
+	var appErr *util.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 422 || appErr.Code != util.CodeSafeguardBinding {
+		t.Fatalf("completing with a keyless safeguard must return 422 SAFEGUARD_BINDING_REQUIRED, got %v", err)
+	}
+	if !strings.Contains(appErr.Message, "独立性键") {
+		t.Fatalf("error must prompt to complete the independence key, got %q", appErr.Message)
+	}
+
+	// The rejected completion must not rewrite the item or create a binding.
+	after := fixture.getItemRecord(t, item.ID)
+	if after.State != before.State || after.CompletedBy != nil || after.CompletedAt != nil {
+		t.Fatalf("item must be unchanged after rejected completion: %#v", after)
+	}
+	if bindings, err := fixture.items.FindActiveBindings(ctx, []uint{keyless.ID}); err != nil || len(bindings) != 0 {
+		t.Fatalf("no binding may be created for a keyless safeguard, got %#v (%v)", bindings, err)
+	}
+
+	// Once the ledger record is given a proper independence key, completion succeeds.
+	keyless.IndependenceKey = "SIS-R201-PRESSURE"
+	if err := fixture.safeguards.Update(ctx, &keyless); err != nil {
+		t.Fatalf("fill independence key: %v", err)
+	}
+	completed, err := fixture.service.Complete(ctx, item.ID,
+		dto.CompleteRectificationRequest{SafeguardIDs: []uint{keyless.ID}}, fixture.reviewer)
+	if err != nil || completed.State != "completed" || len(completed.Bindings) != 1 {
+		t.Fatalf("completion after fixing the key should succeed, got %#v (%v)", completed, err)
+	}
+}

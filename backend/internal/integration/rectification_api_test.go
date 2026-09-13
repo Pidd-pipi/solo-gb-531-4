@@ -141,6 +141,9 @@ func newAPIFixture(t *testing.T, opts ...fixtureOption) *apiFixture {
 	rectificationHandler := handler.NewRectificationItemHandler(service.NewRectificationItemService(
 		serviceItemRepo, evaluationRepo, safeguardRepo, auditRepo,
 	))
+	safeguardHandler := handler.NewSafeguardHandler(service.NewSafeguardService(
+		safeguardRepo, scenarioRepo, auditRepo,
+	))
 
 	auth := middleware.NewAuthenticator(userRepo, cfg)
 	loginLimiter := middleware.NewRateLimiter(cfg.LoginLimitPerMinute)
@@ -158,6 +161,7 @@ func newAPIFixture(t *testing.T, opts ...fixtureOption) *apiFixture {
 	authenticated = append(authenticated, middleware.Audit(auditRepo))
 	api.Use(authenticated...)
 	router.RegisterRectificationItemRoutes(api, rectificationHandler)
+	router.RegisterSafeguardRoutes(api, safeguardHandler)
 	engine.NoRoute(func(c *gin.Context) {
 		util.Fail(c, util.NewError(http.StatusNotFound, util.CodeNotFound, "route was not found"))
 	})

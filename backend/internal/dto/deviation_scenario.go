@@ -1,9 +1,11 @@
 package dto
+
 import (
 	"hazop-safeguard-coverage/backend/internal/model"
 	"strings"
 	"time"
 )
+
 type CreateDeviationScenarioRequest struct {
 	ProcessNodeID uint   `json:"process_node_id" binding:"required"`
 	Guideword     string `json:"guideword" binding:"required,oneof=no more less reverse other"`
@@ -13,12 +15,14 @@ type CreateDeviationScenarioRequest struct {
 	Likelihood    int    `json:"likelihood" binding:"required,min=1,max=5"`
 	Severity      int    `json:"severity" binding:"required,min=1,max=5"`
 }
+
 func (r *CreateDeviationScenarioRequest) Normalize() {
 	r.Guideword = strings.ToLower(strings.TrimSpace(r.Guideword))
 	r.Parameter = strings.TrimSpace(r.Parameter)
 	r.Cause = strings.TrimSpace(r.Cause)
 	r.Consequence = strings.TrimSpace(r.Consequence)
 }
+
 type UpdateDeviationScenarioRequest struct {
 	Guideword   *string `json:"guideword" binding:"omitempty,oneof=no more less reverse other"`
 	Parameter   *string `json:"parameter" binding:"omitempty,min=1,max=120"`
@@ -28,6 +32,7 @@ type UpdateDeviationScenarioRequest struct {
 	Severity    *int    `json:"severity" binding:"omitempty,min=1,max=5"`
 	Version     int     `json:"version" binding:"required,min=1"`
 }
+
 func (r *UpdateDeviationScenarioRequest) Normalize() {
 	if r.Guideword != nil {
 		value := strings.ToLower(strings.TrimSpace(*r.Guideword))
@@ -37,6 +42,7 @@ func (r *UpdateDeviationScenarioRequest) Normalize() {
 	r.Cause = trimPointer(r.Cause)
 	r.Consequence = trimPointer(r.Consequence)
 }
+
 type TransitionScenarioRequest struct {
 	ToState string `json:"to_state" binding:"required,oneof=analyzed verified accepted rework"`
 	Comment string `json:"comment" binding:"omitempty,max=1000"`
@@ -86,6 +92,7 @@ type DeviationScenarioListResponse struct {
 	Page  int                         `json:"page"`
 	Size  int                         `json:"page_size"`
 }
+
 func NewDeviationScenarioResponse(s model.DeviationScenario) DeviationScenarioResponse {
 	response := DeviationScenarioResponse{
 		ID: s.ID, ProcessNodeID: s.ProcessNodeID, Guideword: s.Guideword, Parameter: s.Parameter,

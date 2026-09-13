@@ -320,6 +320,12 @@ func (s *rectificationItemService) Complete(
 				fmt.Sprintf("保护层 #%d 不属于该整改项的偏差场景", safeguardID),
 			)
 		}
+		if strings.TrimSpace(safeguard.IndependenceKey) == "" {
+			return dto.RectificationItemResponse{}, util.NewError(
+				http.StatusUnprocessableEntity, util.CodeSafeguardBinding,
+				fmt.Sprintf("保护层 #%d 缺少独立性键，推演无法将其计入覆盖，请先在保护层台账补全 independence_key 后再完成整改", safeguardID),
+			)
+		}
 		if !safeguard.IsEffectiveAt(now) {
 			return dto.RectificationItemResponse{}, util.NewError(
 				http.StatusUnprocessableEntity, util.CodeSafeguardBinding,

@@ -1,9 +1,11 @@
 package dto
+
 import (
 	"encoding/json"
 	"hazop-safeguard-coverage/backend/internal/model"
 	"time"
 )
+
 type RunCoverageEvaluationRequest struct {
 	ScenarioID uint `json:"scenario_id" binding:"required"`
 }
@@ -85,6 +87,7 @@ type EvaluationComparisonResponse struct {
 	RiskRankChanged    bool    `json:"risk_rank_changed"`
 	InputChanged       bool    `json:"input_changed"`
 }
+
 func NewCoverageEvaluationResponse(e model.CoverageEvaluation) CoverageEvaluationResponse {
 	response := CoverageEvaluationResponse{
 		ID: e.ID, ScenarioID: e.ScenarioID, AlgorithmVersion: e.AlgorithmVersion,

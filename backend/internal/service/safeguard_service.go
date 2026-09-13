@@ -1,4 +1,5 @@
 package service
+
 import (
 	"context"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"time"
 )
+
 type SafeguardService interface {
 	Create(context.Context, dto.CreateSafeguardRequest, util.Actor) (dto.SafeguardResponse, error)
 	Get(context.Context, uint) (dto.SafeguardResponse, error)
@@ -26,6 +28,7 @@ type safeguardService struct {
 	audits     repository.AuditRepository
 	now        func() time.Time
 }
+
 func NewSafeguardService(
 	safeguards repository.SafeguardRepository,
 	scenarios repository.DeviationScenarioRepository,
@@ -42,6 +45,12 @@ func (s *safeguardService) Create(
 	actor util.Actor,
 ) (dto.SafeguardResponse, error) {
 	request.Normalize()
+	if request.IndependenceKey == "" {
+		return dto.SafeguardResponse{}, util.NewError(
+			http.StatusUnprocessableEntity, util.CodeValidation,
+			"独立性键（independence_key）不能为空或纯空白，保护层必须有明确的独立性标识",
+		)
+	}
 	if _, err := s.scenarios.GetByID(ctx, request.TargetScenarioID, false); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return dto.SafeguardResponse{}, util.NotFound("deviation scenario")
@@ -120,6 +129,12 @@ func (s *safeguardService) Update(
 		return dto.SafeguardResponse{}, util.WrapError(http.StatusInternalServerError, util.CodeInternal, "unable to load safeguard", err)
 	}
 	before := safeguard
+	if request.IndependenceKey != nil && *request.IndependenceKey == "" {
+		return dto.SafeguardResponse{}, util.NewError(
+			http.StatusUnprocessableEntity, util.CodeValidation,
+			"独立性键（independence_key）不能为空或纯空白，保护层必须有明确的独立性标识",
+		)
+	}
 	if request.Name != nil {
 		safeguard.Name = *request.Name
 	}

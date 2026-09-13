@@ -1,4 +1,5 @@
 package service
+
 import (
 	"context"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 )
+
 type ProcessNodeService interface {
 	Create(context.Context, dto.CreateProcessNodeRequest, util.Actor) (dto.ProcessNodeResponse, error)
 	Get(context.Context, uint) (dto.ProcessNodeResponse, error)
@@ -24,6 +26,7 @@ type processNodeService struct {
 	audits repository.AuditRepository
 	now    func() time.Time
 }
+
 func NewProcessNodeService(nodes repository.ProcessNodeRepository, audits repository.AuditRepository) ProcessNodeService {
 	return &processNodeService{nodes: nodes, audits: audits, now: func() time.Time { return time.Now().UTC() }}
 }

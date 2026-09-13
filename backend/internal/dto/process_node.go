@@ -1,9 +1,11 @@
 package dto
+
 import (
 	"hazop-safeguard-coverage/backend/internal/model"
 	"strings"
 	"time"
 )
+
 type CreateProcessNodeRequest struct {
 	NodeCode          string  `json:"node_code" binding:"required,min=2,max=40"`
 	Name              string  `json:"name" binding:"required,min=2,max=160"`
@@ -13,6 +15,7 @@ type CreateProcessNodeRequest struct {
 	DesignTemperature float64 `json:"design_temperature" binding:"gte=-273.15,lte=5000"`
 	OwnerTeam         string  `json:"owner_team" binding:"required,min=2,max=120"`
 }
+
 func (r *CreateProcessNodeRequest) Normalize() {
 	r.NodeCode = strings.ToUpper(strings.TrimSpace(r.NodeCode))
 	r.Name = strings.TrimSpace(r.Name)
@@ -20,6 +23,7 @@ func (r *CreateProcessNodeRequest) Normalize() {
 	r.Medium = strings.TrimSpace(r.Medium)
 	r.OwnerTeam = strings.TrimSpace(r.OwnerTeam)
 }
+
 type UpdateProcessNodeRequest struct {
 	Name              *string  `json:"name" binding:"omitempty,min=2,max=160"`
 	UnitName          *string  `json:"unit_name" binding:"omitempty,min=2,max=160"`
@@ -29,12 +33,14 @@ type UpdateProcessNodeRequest struct {
 	OwnerTeam         *string  `json:"owner_team" binding:"omitempty,min=2,max=120"`
 	Status            *string  `json:"status" binding:"omitempty,oneof=active inactive"`
 }
+
 func (r *UpdateProcessNodeRequest) Normalize() {
 	r.Name = trimPointer(r.Name)
 	r.UnitName = trimPointer(r.UnitName)
 	r.Medium = trimPointer(r.Medium)
 	r.OwnerTeam = trimPointer(r.OwnerTeam)
 }
+
 type ProcessNodeQuery struct {
 	Search    string
 	UnitName  string
@@ -63,6 +69,7 @@ type ProcessNodeListResponse struct {
 	Page  int                   `json:"page"`
 	Size  int                   `json:"page_size"`
 }
+
 func NewProcessNodeResponse(node model.ProcessNode, summary model.ProcessNodeSummary) ProcessNodeResponse {
 	return ProcessNodeResponse{
 		ID: node.ID, NodeCode: node.NodeCode, Name: node.Name, UnitName: node.UnitName,

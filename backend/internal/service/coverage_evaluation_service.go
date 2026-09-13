@@ -1,4 +1,5 @@
 package service
+
 import (
 	"context"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 )
+
 type CoverageEvaluationService interface {
 	Run(context.Context, dto.RunCoverageEvaluationRequest, string, util.Actor) (dto.CoverageEvaluationResponse, bool, error)
 	Get(context.Context, uint) (dto.CoverageEvaluationResponse, error)
@@ -32,6 +34,7 @@ type coverageEvaluationService struct {
 	evaluator   *algorithm.Evaluator
 	now         func() time.Time
 }
+
 func NewCoverageEvaluationService(
 	evaluations repository.CoverageEvaluationRepository,
 	scenarios repository.DeviationScenarioRepository,

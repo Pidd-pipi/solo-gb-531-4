@@ -1,4 +1,5 @@
 package service
+
 import (
 	"context"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"time"
 )
+
 type DeviationScenarioService interface {
 	Create(context.Context, dto.CreateDeviationScenarioRequest, util.Actor) (dto.DeviationScenarioResponse, error)
 	Get(context.Context, uint) (dto.DeviationScenarioResponse, error)
@@ -25,6 +27,7 @@ type deviationScenarioService struct {
 	audits    repository.AuditRepository
 	now       func() time.Time
 }
+
 func NewDeviationScenarioService(
 	scenarios repository.DeviationScenarioRepository,
 	nodes repository.ProcessNodeRepository,
