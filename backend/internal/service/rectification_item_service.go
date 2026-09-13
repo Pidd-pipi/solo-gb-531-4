@@ -58,6 +58,12 @@ func (s *rectificationItemService) Generate(
 	actor util.Actor,
 ) (dto.GenerateRectificationResponse, error) {
 	request.Normalize()
+	if request.OwnerName == "" {
+		return dto.GenerateRectificationResponse{}, util.NewError(
+			http.StatusUnprocessableEntity, util.CodeValidation,
+			"生成整改项必须指定明确的责任人（owner_name 不能为空或纯空白）",
+		)
+	}
 	evaluation, err := s.evaluations.GetByID(ctx, request.EvaluationID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -180,6 +186,12 @@ func (s *rectificationItemService) Update(
 	}
 	updates := map[string]any{}
 	if request.OwnerName != nil {
+		if *request.OwnerName == "" {
+			return dto.RectificationItemResponse{}, util.NewError(
+				http.StatusUnprocessableEntity, util.CodeValidation,
+				"责任人不能为空或纯空白，已指派的责任人不允许被清空",
+			)
+		}
 		updates["owner_name"] = *request.OwnerName
 	}
 	if request.DueDate != nil {
@@ -226,6 +238,13 @@ func (s *rectificationItemService) Transition(
 		return dto.RectificationItemResponse{}, util.NewError(
 			http.StatusConflict, util.CodeStateTransition,
 			fmt.Sprintf("rectification item cannot transition from %s to %s", before.State, request.ToState),
+		)
+	}
+	if from == constants.RectificationPending && to == constants.RectificationInProgress &&
+		strings.TrimSpace(before.OwnerName) == "" {
+		return dto.RectificationItemResponse{}, util.NewError(
+			http.StatusUnprocessableEntity, util.CodeValidation,
+			"转入整改中之前必须先指派明确的责任人",
 		)
 	}
 	updates := map[string]any{}

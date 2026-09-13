@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"hazop-safeguard-coverage/backend/internal/algorithm"
+	"hazop-safeguard-coverage/backend/internal/constants"
 	"hazop-safeguard-coverage/backend/internal/dto"
 	"hazop-safeguard-coverage/backend/internal/model"
 	"hazop-safeguard-coverage/backend/internal/repository"
@@ -124,7 +125,9 @@ func (f rectificationFixture) generateSecond(t *testing.T) dto.RectificationItem
 	if err := f.evaluations.Create(context.Background(), &evaluation); err != nil {
 		t.Fatalf("create second evaluation: %v", err)
 	}
-	result, err := f.service.Generate(context.Background(), dto.GenerateRectificationRequest{EvaluationID: evaluation.ID}, f.engineer)
+	result, err := f.service.Generate(context.Background(), dto.GenerateRectificationRequest{
+		EvaluationID: evaluation.ID, OwnerName: "李工",
+	}, f.engineer)
 	if err != nil {
 		t.Fatalf("generate second rectification item: %v", err)
 	}
@@ -151,7 +154,9 @@ func TestRectificationGenerateAndDuplicateBlocked(t *testing.T) {
 	if item.State != "pending" || item.OwnerName != "张工" || item.Cause != "blocked outlet" {
 		t.Fatalf("unexpected generated item: %#v", item)
 	}
-	duplicate, err := fixture.service.Generate(ctx, dto.GenerateRectificationRequest{EvaluationID: fixture.evaluation.ID}, fixture.engineer)
+	duplicate, err := fixture.service.Generate(ctx, dto.GenerateRectificationRequest{
+		EvaluationID: fixture.evaluation.ID, OwnerName: "张工",
+	}, fixture.engineer)
 	if err != nil {
 		t.Fatalf("second generate should not fail: %v", err)
 	}
@@ -179,7 +184,9 @@ func TestRectificationGenerateAndDuplicateBlocked(t *testing.T) {
 	if err := fixture.evaluations.Create(ctx, &queued); err != nil {
 		t.Fatalf("create queued evaluation: %v", err)
 	}
-	_, err = fixture.service.Generate(ctx, dto.GenerateRectificationRequest{EvaluationID: queued.ID}, fixture.engineer)
+	_, err = fixture.service.Generate(ctx, dto.GenerateRectificationRequest{
+		EvaluationID: queued.ID, OwnerName: "张工",
+	}, fixture.engineer)
 	var appErr *util.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 409 {
 		t.Fatalf("generate from queued evaluation should return 409, got %v", err)
@@ -446,4 +453,127 @@ func TestRectificationCompletedRecordImmutable(t *testing.T) {
 	if reloaded.CompletedBy == nil || *reloaded.CompletedBy != *completed.CompletedBy || !reloaded.CompletedAt.Equal(*completed.CompletedAt) {
 		t.Fatalf("completed_by/at must stay unchanged: %#v vs %#v", reloaded.CompletedBy, completed.CompletedBy)
 	}
+}
+
+// createOwnerlessItem writes a pending rectification item with a blank owner
+// straight to the repository, simulating a legacy row created before the owner
+// validation existed.
+func (f rectificationFixture) createOwnerlessItem(t *testing.T, suffix string) model.RectificationItem {
+	t.Helper()
+	now := time.Now().UTC()
+	item := model.RectificationItem{
+		GapFingerprint: util.HashString("ownerless-" + suffix), EvaluationID: f.evaluation.ID,
+		ScenarioID: f.scenario.ID, PathID: "P-OWNERLESS-" + suffix, NodeCode: "R-201",
+		Cause: "ownerless cause " + suffix, Consequence: "ownerless consequence " + suffix,
+		OwnerName: "   ", EvidenceNote: "",
+		State:       string(constants.RectificationPending),
+		GeneratedBy: f.engineer.UserID, GeneratedByName: f.engineer.Username,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := f.items.Create(context.Background(), &item); err != nil {
+		t.Fatalf("create ownerless item: %v", err)
+	}
+	return item
+}
+
+func TestRectificationGenerateRejectsBlankOwner(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	ctx := context.Background()
+	var appErr *util.AppError
+	for _, owner := range []string{"", "   ", "\t\n"} {
+		_, err := fixture.service.Generate(ctx, dto.GenerateRectificationRequest{
+			EvaluationID: fixture.evaluation.ID, OwnerName: owner,
+		}, fixture.engineer)
+		if !errors.As(err, &appErr) || appErr.Status != 422 || appErr.Code != util.CodeValidation {
+			t.Fatalf("generate with owner %q must return 422 VALIDATION_FAILED, got %v", owner, err)
+		}
+	}
+	var count int64
+	if err := fixture.db.Model(&model.RectificationItem{}).Count(&count).Error; err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected generates must create no item, found %d", count)
+	}
+}
+
+func TestRectificationUpdateRejectsBlankOwnerAndProtectsClosedRecords(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	ctx := context.Background()
+	item := fixture.generateOne(t)
+	var appErr *util.AppError
+	for _, blank := range []string{"", "   "} {
+		_, err := fixture.service.Update(ctx, item.ID,
+			dto.UpdateRectificationRequest{OwnerName: &blank}, fixture.engineer)
+		if !errors.As(err, &appErr) || appErr.Status != 422 || appErr.Code != util.CodeValidation {
+			t.Fatalf("clearing owner with %q must return 422, got %v", blank, err)
+		}
+	}
+	reloaded, err := fixture.service.Get(ctx, item.ID)
+	if err != nil || reloaded.OwnerName != "张工" {
+		t.Fatalf("assigned owner must survive blank updates, got %q (%v)", reloaded.OwnerName, err)
+	}
+	// A non-owner field update still works.
+	updated, err := fixture.service.Update(ctx, item.ID,
+		dto.UpdateRectificationRequest{EvidenceNote: strPtr("已安排排查")}, fixture.engineer)
+	if err != nil || updated.EvidenceNote != "已安排排查" || updated.OwnerName != "张工" {
+		t.Fatalf("non-owner update should apply and keep owner, got %#v (%v)", updated, err)
+	}
+	// Editing a voided record is still blocked.
+	fixture.toPendingReview(t, item.ID)
+	returned, err := fixture.service.Return(ctx, item.ID, dto.ReturnRectificationRequest{Reason: "补充材料"}, fixture.reviewer)
+	if err != nil || returned.State != "in_progress" {
+		t.Fatalf("return item: %v", err)
+	}
+	if _, err := fixture.service.Transition(ctx, item.ID,
+		dto.TransitionRectificationRequest{ToState: "voided", Reason: "场景取消"}, fixture.engineer); err != nil {
+		t.Fatalf("void item: %v", err)
+	}
+	_, err = fixture.service.Update(ctx, item.ID,
+		dto.UpdateRectificationRequest{OwnerName: strPtr("新责任人")}, fixture.engineer)
+	if !errors.As(err, &appErr) || appErr.Status != 409 {
+		t.Fatalf("editing a voided item must still return 409, got %v", err)
+	}
+}
+
+func TestRectificationStartRequiresAssignedOwner(t *testing.T) {
+	fixture := newRectificationFixture(t)
+	ctx := context.Background()
+	ownerless := fixture.createOwnerlessItem(t, "1")
+	var appErr *util.AppError
+	_, err := fixture.service.Transition(ctx, ownerless.ID,
+		dto.TransitionRectificationRequest{ToState: "in_progress"}, fixture.engineer)
+	if !errors.As(err, &appErr) || appErr.Status != 422 || appErr.Code != util.CodeValidation {
+		t.Fatalf("starting an ownerless item must return 422 VALIDATION_FAILED, got %v", err)
+	}
+	loaded := fixture.getItemRecord(t, ownerless.ID)
+	if loaded.State != string(constants.RectificationPending) {
+		t.Fatalf("blocked start must leave the item pending, got %s", loaded.State)
+	}
+	// Assigning an owner unblocks the transition.
+	if _, err := fixture.service.Update(ctx, ownerless.ID,
+		dto.UpdateRectificationRequest{OwnerName: strPtr("赵工")}, fixture.engineer); err != nil {
+		t.Fatalf("assign owner: %v", err)
+	}
+	started, err := fixture.service.Transition(ctx, ownerless.ID,
+		dto.TransitionRectificationRequest{ToState: "in_progress"}, fixture.engineer)
+	if err != nil || started.State != "in_progress" {
+		t.Fatalf("start after assigning owner should succeed, got %s (%v)", started.State, err)
+	}
+	// A properly generated item (with owner) starts with no gate.
+	withOwner := fixture.generateOne(t)
+	started2, err := fixture.service.Transition(ctx, withOwner.ID,
+		dto.TransitionRectificationRequest{ToState: "in_progress"}, fixture.engineer)
+	if err != nil || started2.State != "in_progress" {
+		t.Fatalf("an item with an owner should start freely, got %v", err)
+	}
+}
+
+func (f rectificationFixture) getItemRecord(t *testing.T, id uint) model.RectificationItem {
+	t.Helper()
+	item, err := f.items.GetByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("load item %d: %v", id, err)
+	}
+	return item
 }

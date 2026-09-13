@@ -504,7 +504,7 @@ func TestRectificationAPIGenerateIdempotentOnRepost(t *testing.T) {
 	}
 	resp := f.clientFor("engineer").do(http.MethodPost,
 		baseURL+"/rectification-items/generate",
-		map[string]any{"evaluation_id": evaluation.ID})
+		map[string]any{"evaluation_id": evaluation.ID, "owner_name": "张工-IDEM"})
 	resp.expect(t, http.StatusCreated, "OK")
 	var generated dto.GenerateRectificationResponse
 	resp.decodeData(t, &generated)
@@ -545,7 +545,8 @@ func TestRectificationAPIGenerateFromNonCompletedEvaluation(t *testing.T) {
 		t.Fatalf("create queued evaluation: %v", err)
 	}
 	resp := f.clientFor("engineer").do(http.MethodPost,
-		baseURL+"/rectification-items/generate", map[string]any{"evaluation_id": queued.ID})
+		baseURL+"/rectification-items/generate",
+		map[string]any{"evaluation_id": queued.ID, "owner_name": "张工-QUEUED"})
 	resp.expect(t, http.StatusConflict, util.CodeConflict)
 	var count int64
 	if err := f.db.Model(&model.RectificationItem{}).Count(&count).Error; err != nil {
@@ -553,5 +554,102 @@ func TestRectificationAPIGenerateFromNonCompletedEvaluation(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("no item may be generated from a queued evaluation, found %d", count)
+	}
+}
+
+// TestRectificationAPIOwnerValidation exercises the responsible-person rules
+// end to end: blank owners are rejected on generate and edit, an already
+// assigned owner cannot be overwritten with blanks, an unassigned pending item
+// cannot enter in_progress, and edits to voided/completed records stay blocked.
+func TestRectificationAPIOwnerValidation(t *testing.T) {
+	f := newAPIFixture(t)
+	_, scenario := f.createNodeScenario(t, "OWNER")
+	evaluation := f.createCompletedEvaluation(t, "OWNER", scenario.ID, "P-OWNER",
+		"cause-owner", "consequence-owner")
+	engineer := f.clientFor("engineer")
+
+	// Blank or whitespace-only owners are rejected at generation; nothing is created.
+	for _, owner := range []string{"", "   ", "\t\n"} {
+		resp := engineer.do(http.MethodPost, baseURL+"/rectification-items/generate",
+			map[string]any{"evaluation_id": evaluation.ID, "owner_name": owner})
+		resp.expect(t, http.StatusUnprocessableEntity, util.CodeValidation)
+	}
+	var count int64
+	if err := f.db.Model(&model.RectificationItem{}).Count(&count).Error; err != nil {
+		t.Fatalf("count items: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("blank-owner generations must create no item, found %d", count)
+	}
+
+	// A valid owner generates the item.
+	item := f.generateItem(t, engineer, evaluation.ID, "张工-OWNER")
+
+	// An assigned owner cannot be replaced with blanks through PUT.
+	for _, blank := range []string{"", "   "} {
+		resp := engineer.do(http.MethodPut,
+			fmt.Sprintf("%s/rectification-items/%d", baseURL, item.ID),
+			map[string]any{"owner_name": blank})
+		resp.expect(t, http.StatusUnprocessableEntity, util.CodeValidation)
+	}
+	getResp := engineer.do(http.MethodGet,
+		fmt.Sprintf("%s/rectification-items/%d", baseURL, item.ID), nil)
+	getResp.expect(t, http.StatusOK, "OK")
+	var current dto.RectificationItemResponse
+	getResp.decodeData(t, &current)
+	if current.OwnerName != "张工-OWNER" {
+		t.Fatalf("assigned owner must survive blank updates, got %q", current.OwnerName)
+	}
+
+	// A legacy ownerless pending item cannot move to in_progress until an owner is set.
+	legacy := f.generateItem(t, engineer,
+		f.createCompletedEvaluation(t, "OWNERLESS", scenario.ID, "P-OWNERLESS",
+			"cause-ownerless", "consequence-ownerless").ID,
+		"临时责任人")
+	if err := f.db.Model(&model.RectificationItem{}).Where("id = ?", legacy.ID).
+		Update("owner_name", "   ").Error; err != nil {
+		t.Fatalf("simulate legacy ownerless item: %v", err)
+	}
+	beforeStart := f.getItem(t, legacy.ID)
+	resp := f.transition(t, engineer, legacy.ID, "in_progress", "")
+	resp.expect(t, http.StatusUnprocessableEntity, util.CodeValidation)
+	f.assertItemUntouched(t, legacy.ID, beforeStart)
+
+	assignResp := engineer.do(http.MethodPut,
+		fmt.Sprintf("%s/rectification-items/%d", baseURL, legacy.ID),
+		map[string]any{"owner_name": "赵工-OWNER"})
+	assignResp.expect(t, http.StatusOK, "OK")
+	resp = f.transition(t, engineer, legacy.ID, "in_progress", "")
+	resp.expect(t, http.StatusOK, "OK")
+	if f.getItem(t, legacy.ID).State != "in_progress" {
+		t.Fatalf("item should start after an owner is assigned")
+	}
+
+	// Edits to a completed record remain blocked even with a valid new owner.
+	completedChain := f.seedChain(t, "OWNERCLOSED")
+	f.moveToPendingReview(t, engineer, completedChain.itemID)
+	safeguard := f.addSafeguard(t, "owner-closed-safeguard", completedChain.scenarioID, time.Now().Add(time.Minute))
+	f.complete(t, f.clientFor("reviewer"), completedChain.itemID, []uint{safeguard.ID}).
+		expect(t, http.StatusOK, "OK")
+	editClosed := engineer.do(http.MethodPut,
+		fmt.Sprintf("%s/rectification-items/%d", baseURL, completedChain.itemID),
+		map[string]any{"owner_name": "新责任人"})
+	editClosed.expect(t, http.StatusConflict, util.CodeStateTransition)
+	closed := f.getItem(t, completedChain.itemID)
+	if closed.State != "completed" || len(closed.Bindings) != 1 {
+		t.Fatalf("completed record must stay intact after rejected edit, state=%s bindings=%d",
+			closed.State, len(closed.Bindings))
+	}
+
+	// Edits to a voided record remain blocked as well.
+	voidedChain := f.seedChain(t, "OWNERVOID")
+	resp = f.transition(t, engineer, voidedChain.itemID, "voided", "场景已取消整改")
+	resp.expect(t, http.StatusOK, "OK")
+	editVoided := engineer.do(http.MethodPut,
+		fmt.Sprintf("%s/rectification-items/%d", baseURL, voidedChain.itemID),
+		map[string]any{"owner_name": "新责任人"})
+	editVoided.expect(t, http.StatusConflict, util.CodeStateTransition)
+	if f.getItem(t, voidedChain.itemID).State != "voided" {
+		t.Fatalf("voided record must remain voided after rejected edit")
 	}
 }
