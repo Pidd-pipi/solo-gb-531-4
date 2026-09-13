@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -74,14 +75,28 @@ type apiResponse struct {
 type apiClient struct {
 	fixture *apiFixture
 	token   string
+	headers map[string]string
 }
 
-func newAPIFixture(t *testing.T) *apiFixture {
+func newAPIFixture(t *testing.T, opts ...fixtureOption) *apiFixture {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
-	// Shared-cache in-memory DSN keeps every connection on the same database.
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", sanitizeDSN(t.Name()))
+	options := fixtureOptions{maxConns: 1}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	// Default: a shared-cache in-memory database on one connection, mirroring the
+	// production SQLite pool and serializing writes. Concurrency tests opt into a
+	// multi-connection, WAL-backed file database so requests really overlap.
+	var dsn string
+	if options.maxConns > 1 {
+		dsn = fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=10000",
+			filepath.Join(t.TempDir(), "app.db"))
+	} else {
+		dsn = fmt.Sprintf("file:%s?mode=memory&cache=shared", sanitizeDSN(t.Name()))
+	}
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
@@ -93,14 +108,13 @@ func newAPIFixture(t *testing.T) *apiFixture {
 	); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
-	// Mirror the production SQLite pool: a single connection serializes writes
-	// and makes the concurrent binding race deterministic at the database layer.
 	sqlDB, err := db.DB()
 	if err != nil {
 		t.Fatalf("raw db: %v", err)
 	}
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetMaxOpenConns(options.maxConns)
+	sqlDB.SetMaxIdleConns(options.maxConns)
+	sqlDB.SetConnMaxLifetime(time.Hour)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	cfg := config.Config{
@@ -117,8 +131,15 @@ func newAPIFixture(t *testing.T) *apiFixture {
 	auditRepo := repository.NewAuditRepository(db)
 	userRepo := repository.NewUserRepository(db)
 
+	// The service may be handed an instrumented item repository (concurrency
+	// tests); test-side assertions keep using the plain repository.
+	serviceItemRepo := repository.RectificationItemRepository(itemRepo)
+	if options.itemRepo != nil {
+		serviceItemRepo = options.itemRepo(db)
+	}
+
 	rectificationHandler := handler.NewRectificationItemHandler(service.NewRectificationItemService(
-		itemRepo, evaluationRepo, safeguardRepo, auditRepo,
+		serviceItemRepo, evaluationRepo, safeguardRepo, auditRepo,
 	))
 
 	auth := middleware.NewAuthenticator(userRepo, cfg)
@@ -130,7 +151,12 @@ func newAPIFixture(t *testing.T) *apiFixture {
 	v1 := engine.Group("/api/v1")
 	v1.POST("/auth/login", loginLimiter.Middleware("login"), auth.Login)
 	api := v1.Group("")
-	api.Use(auth.RequireAuth(), middleware.Audit(auditRepo))
+	authenticated := []gin.HandlerFunc{auth.RequireAuth()}
+	if options.extraMiddleware != nil {
+		authenticated = append(authenticated, options.extraMiddleware)
+	}
+	authenticated = append(authenticated, middleware.Audit(auditRepo))
+	api.Use(authenticated...)
 	router.RegisterRectificationItemRoutes(api, rectificationHandler)
 	engine.NoRoute(func(c *gin.Context) {
 		util.Fail(c, util.NewError(http.StatusNotFound, util.CodeNotFound, "route was not found"))
@@ -152,6 +178,34 @@ func newAPIFixture(t *testing.T) *apiFixture {
 	}
 	fixture.seedUsers()
 	return fixture
+}
+
+// fixtureOptions tunes the private application harness.
+type fixtureOptions struct {
+	// maxConns sets the database connection-pool size. Values above 1 switch the
+	// harness to a WAL-backed file database so concurrent writes genuinely race.
+	maxConns int
+	// itemRepo optionally replaces the rectification repository used by the
+	// service (e.g. to instrument transaction boundaries in concurrency tests).
+	itemRepo func(*gorm.DB) repository.RectificationItemRepository
+	// extraMiddleware is installed inside the authenticated group, so it runs
+	// after RequireAuth and can read both request headers and the actor.
+	extraMiddleware gin.HandlerFunc
+}
+
+// fixtureOption customizes an apiFixture.
+type fixtureOption func(*fixtureOptions)
+
+func withPoolSize(size int) fixtureOption {
+	return func(o *fixtureOptions) { o.maxConns = size }
+}
+
+func withItemRepoOverride(fn func(*gorm.DB) repository.RectificationItemRepository) fixtureOption {
+	return func(o *fixtureOptions) { o.itemRepo = fn }
+}
+
+func withExtraMiddleware(mw gin.HandlerFunc) fixtureOption {
+	return func(o *fixtureOptions) { o.extraMiddleware = mw }
 }
 
 func sanitizeDSN(name string) string {
@@ -247,6 +301,10 @@ func (f *apiFixture) forgedToken() string {
 }
 
 func (f *apiFixture) request(method, path, token string, body any) apiResponse {
+	return f.requestWith(method, path, token, body, nil)
+}
+
+func (f *apiFixture) requestWith(method, path, token string, body any, headers map[string]string) apiResponse {
 	f.t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -265,6 +323,9 @@ func (f *apiFixture) request(method, path, token string, body any) apiResponse {
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -285,7 +346,19 @@ func (f *apiFixture) request(method, path, token string, body any) apiResponse {
 }
 
 func (c *apiClient) do(method, path string, body any) apiResponse {
-	return c.fixture.request(method, path, c.token, body)
+	return c.fixture.requestWith(method, path, c.token, body, c.headers)
+}
+
+// withHeader returns a derived client that attaches an extra header to every
+// request; concurrency tests use it to carry a winner/loser marker that the
+// instrumented repository can read from the request context.
+func (c *apiClient) withHeader(key, value string) *apiClient {
+	headers := make(map[string]string, len(c.headers)+1)
+	for k, v := range c.headers {
+		headers[k] = v
+	}
+	headers[key] = value
+	return &apiClient{fixture: c.fixture, token: c.token, headers: headers}
 }
 
 func (r apiResponse) decodeData(t *testing.T, target any) {

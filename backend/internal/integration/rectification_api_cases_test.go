@@ -12,7 +12,10 @@ import (
 	"hazop-safeguard-coverage/backend/internal/algorithm"
 	"hazop-safeguard-coverage/backend/internal/dto"
 	"hazop-safeguard-coverage/backend/internal/model"
+	"hazop-safeguard-coverage/backend/internal/repository"
 	"hazop-safeguard-coverage/backend/internal/util"
+
+	"gorm.io/gorm"
 )
 
 // generatedChain is the shared fixture state for a scenario with one
@@ -374,98 +377,168 @@ func TestRectificationAPIDuplicateBindingRejected(t *testing.T) {
 	}
 }
 
-// TestRectificationAPIConcurrentBindingRace fires two completion requests for
-// two different pending-review items against the same safeguard. Exactly one
-// may win: one 200 + one binding + one completed item.
-func TestRectificationAPIConcurrentBindingRace(t *testing.T) {
-	f := newAPIFixture(t)
-	first := f.seedChain(t, "RACE1")
-	evaluation2 := f.createCompletedEvaluation(t, "RACE2", first.scenarioID, "P-RACE2",
-		"cause-race-2", "consequence-race-2")
-	secondItem := f.generateItem(t, f.clientFor("engineer"), evaluation2.ID, "张工-RACE2")
+// prepareTwoReviewItems builds two pending-review items in the same scenario
+// sharing one newly added safeguard, the precondition for a binding race.
+func (f *apiFixture) prepareTwoReviewItems(t *testing.T, key string) (first, second uint, safeguard model.Safeguard) {
+	t.Helper()
+	chain := f.seedChain(t, key)
+	evaluation2 := f.createCompletedEvaluation(t, key+"B", chain.scenarioID, "P-"+key+"B",
+		"cause-"+key+"-2", "consequence-"+key+"-2")
+	secondItem := f.generateItem(t, f.clientFor("engineer"), evaluation2.ID, "张工-"+key+"2")
 	engineer := f.clientFor("engineer")
-	f.moveToPendingReview(t, engineer, first.itemID)
+	f.moveToPendingReview(t, engineer, chain.itemID)
 	f.moveToPendingReview(t, engineer, secondItem.ID)
-	safeguard := f.addSafeguard(t, "raced-safeguard", first.scenarioID, time.Now().Add(time.Minute))
+	safeguard = f.addSafeguard(t, "raced-"+key, chain.scenarioID, time.Now().Add(time.Minute))
+	return chain.itemID, secondItem.ID, safeguard
+}
 
-	results := f.raceCompletions(t, []uint{first.itemID, secondItem.ID}, safeguard.ID)
-	if len(results) != 2 {
-		t.Fatalf("expected 2 responses, got %d", len(results))
-	}
-	successes, conflicts := 0, 0
-	for _, result := range results {
+// assertSingleWinner validates the race invariant for a pair of completion
+// results: exactly one 200 whose item is completed and owns the sole binding,
+// and one 409 SAFEGUARD_ALREADY_BOUND whose item stays pending_review.
+func (f *apiFixture) assertSingleWinner(t *testing.T, itemIDs [2]uint, results [2]apiResponse, safeguardID uint) {
+	t.Helper()
+	winner, losers := -1, 0
+	for i, result := range results {
 		switch {
 		case result.StatusCode == http.StatusOK && result.Envelope.Code == "OK":
-			successes++
-		case result.StatusCode == http.StatusConflict &&
-			(result.Envelope.Code == string(util.CodeSafeguardBound) ||
-				result.Envelope.Code == string(util.CodeStateTransition)):
-			conflicts++
+			if winner != -1 {
+				t.Fatalf("both requests succeeded; only one may win")
+			}
+			winner = i
+		case result.StatusCode == http.StatusConflict && result.Envelope.Code == string(util.CodeSafeguardBound):
+			losers++
 		default:
-			t.Fatalf("unexpected race outcome: %d %s (%s)",
-				result.StatusCode, result.Envelope.Code, result.Envelope.Message)
+			t.Fatalf("unexpected race outcome for item %d: %d %s (%s)",
+				itemIDs[i], result.StatusCode, result.Envelope.Code, result.Envelope.Message)
 		}
 	}
-	if successes != 1 || conflicts != 1 {
-		t.Fatalf("exactly one request may succeed, got %d success and %d conflict", successes, conflicts)
+	if winner == -1 || losers != 1 {
+		t.Fatalf("exactly one success and one SAFEGUARD_ALREADY_BOUND required, winner=%d losers=%d", winner, losers)
 	}
-
-	bindings, err := f.items.FindActiveBindings(context.Background(), []uint{safeguard.ID})
-	if err != nil {
-		t.Fatalf("load bindings: %v", err)
-	}
-	if len(bindings) != 1 {
-		t.Fatalf("exactly one binding row may exist, got %d", len(bindings))
-	}
-	completed := 0
-	for _, id := range []uint{first.itemID, secondItem.ID} {
-		if f.getItem(t, id).State == "completed" {
-			completed++
+	for i, id := range itemIDs {
+		item := f.getItem(t, id)
+		if i == winner {
+			if item.State != "completed" {
+				t.Fatalf("winning item %d must be completed, got %s", id, item.State)
+			}
+			if len(item.Bindings) != 1 || item.Bindings[0].SafeguardID != safeguardID {
+				t.Fatalf("winning item %d must own the unique binding, got %#v", id, item.Bindings)
+			}
+			continue
+		}
+		// The losing request must not have rewritten its rectification item:
+		// no state change, no completion marker, no binding row.
+		if item.State != "pending_review" {
+			t.Fatalf("losing item %d state must stay pending_review, got %s", id, item.State)
+		}
+		if item.CompletedBy != nil || item.CompletedAt != nil || len(item.Bindings) != 0 {
+			t.Fatalf("losing item %d must not be completed or gain bindings: %#v", id, item)
 		}
 	}
-	if completed != 1 {
-		t.Fatalf("exactly one item may be completed, got %d", completed)
-	}
-	if f.getItem(t, bindings[0].ItemID).State != "completed" {
-		t.Fatalf("the binding must belong to the completed item %d", bindings[0].ItemID)
+	if count := f.bindingCount(t, safeguardID); count != 1 {
+		t.Fatalf("exactly one binding row may exist, got %d", count)
 	}
 }
 
-// TestRectificationAPIConcurrentBindingRaceRepeated reruns the race across
-// independent rounds so the unique-index guarantee is exercised repeatedly
-// rather than passing on a single scheduling outcome.
+// TestRectificationAPIConcurrentBindingRace fires two completion requests
+// simultaneously against a multi-connection WAL database, so both requests
+// enter their write transactions on separate connections and genuinely race
+// for the safeguard unique index. Exactly one may succeed; the loser is
+// rejected by the database-level constraint and its item is left untouched.
+func TestRectificationAPIConcurrentBindingRace(t *testing.T) {
+	f := newAPIFixture(t, withPoolSize(8))
+	firstID, secondID, safeguard := f.prepareTwoReviewItems(t, "RACE")
+	results := f.raceCompletions(t, []uint{firstID, secondID}, safeguard.ID)
+	f.assertSingleWinner(t, [2]uint{firstID, secondID},
+		[2]apiResponse{results[0], results[1]}, safeguard.ID)
+}
+
+// TestRectificationAPIConcurrentBindingRaceRepeated reruns the multi-connection
+// race across independent databases so the unique-index guarantee is exercised
+// repeatedly rather than passing on a single scheduling outcome.
 func TestRectificationAPIConcurrentBindingRaceRepeated(t *testing.T) {
 	const rounds = 5
 	for round := 0; round < rounds; round++ {
 		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
-			f := newAPIFixture(t)
+			f := newAPIFixture(t, withPoolSize(8))
 			key := fmt.Sprintf("RR%d", round)
-			first := f.seedChain(t, key)
-			evaluation2 := f.createCompletedEvaluation(t, key+"B", first.scenarioID, "P-"+key+"B",
-				"cause-"+key+"-2", "consequence-"+key+"-2")
-			secondItem := f.generateItem(t, f.clientFor("engineer"), evaluation2.ID, "张工-"+key+"2")
-			engineer := f.clientFor("engineer")
-			f.moveToPendingReview(t, engineer, first.itemID)
-			f.moveToPendingReview(t, engineer, secondItem.ID)
-			safeguard := f.addSafeguard(t, "raced-"+key, first.scenarioID, time.Now().Add(time.Minute))
-
-			results := f.raceCompletions(t, []uint{first.itemID, secondItem.ID}, safeguard.ID)
-			successes := 0
-			for _, result := range results {
-				if result.StatusCode == http.StatusOK {
-					successes++
-				} else if result.StatusCode != http.StatusConflict {
-					t.Fatalf("round %d: unexpected status %d %s",
-						round, result.StatusCode, result.Envelope.Code)
-				}
-			}
-			if successes != 1 {
-				t.Fatalf("round %d: exactly one winner required, got %d", round, successes)
-			}
-			if count := f.bindingCount(t, safeguard.ID); count != 1 {
-				t.Fatalf("round %d: exactly one binding required, got %d", round, count)
-			}
+			firstID, secondID, safeguard := f.prepareTwoReviewItems(t, key)
+			results := f.raceCompletions(t, []uint{firstID, secondID}, safeguard.ID)
+			f.assertSingleWinner(t, [2]uint{firstID, secondID},
+				[2]apiResponse{results[0], results[1]}, safeguard.ID)
 		})
+	}
+}
+
+// TestRectificationAPIStaggeredBindingHitsUniqueIndex deliberately offsets the
+// commit timing: the losing request completes its pre-check (FindActiveBindings
+// sees no conflict) and parks inside its open transaction; the winner then
+// commits the binding; only afterwards is the loser released to INSERT. The
+// pre-check can no longer protect it, so rejection must come from the safeguard
+// unique index. This proves the database constraint is the real backstop.
+func TestRectificationAPIStaggeredBindingHitsUniqueIndex(t *testing.T) {
+	loserTxEntered := make(chan struct{})
+	releaseLoser := make(chan struct{})
+	uniqueViolations := make(chan struct{}, 4)
+	f := newAPIFixture(t,
+		withPoolSize(8),
+		withExtraMiddleware(testRoleMiddleware()),
+		withItemRepoOverride(func(db *gorm.DB) repository.RectificationItemRepository {
+			return newStaggeredRepo(db, loserTxEntered, releaseLoser, uniqueViolations)
+		}),
+	)
+	firstID, secondID, safeguard := f.prepareTwoReviewItems(t, "STAGGER")
+	reviewerToken := f.login("reviewer")
+
+	// Loser parks inside its transaction after a clean pre-check.
+	loserResult := make(chan apiResponse, 1)
+	go func() {
+		client := (&apiClient{fixture: f, token: reviewerToken}).withHeader(testRoleHeader, "loser")
+		loserResult <- f.complete(t, client, secondID, []uint{safeguard.ID})
+	}()
+	select {
+	case <-loserTxEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("losing request never reached the write phase")
+	}
+
+	// Winner runs to completion and commits the only binding while the loser's
+	// pre-check is already behind it.
+	winnerClient := &apiClient{fixture: f, token: reviewerToken}
+	winnerResp := f.complete(t, winnerClient, firstID, []uint{safeguard.ID})
+	winnerResp.expect(t, http.StatusOK, "OK")
+	if winner := f.getItem(t, firstID); winner.State != "completed" || len(winner.Bindings) != 1 {
+		t.Fatalf("winner must complete with one binding, got state=%s bindings=%d",
+			winner.State, len(winner.Bindings))
+	}
+
+	// Release the loser to run its now-duplicate INSERT; the unique index (not
+	// the pre-check) must reject it.
+	close(releaseLoser)
+	loserResp := <-loserResult
+	loserResp.expect(t, http.StatusConflict, util.CodeSafeguardBound)
+
+	// The loser passed its pre-check yet still failed, so the rejection must be
+	// the database-level unique index on rectification_bindings.safeguard_id.
+	select {
+	case <-uniqueViolations:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("losing INSERT was expected to hit the safeguard unique index, but no unique violation was recorded")
+	}
+
+	// The loser's rectification item is not rewritten by the failed commit.
+	loser := f.getItem(t, secondID)
+	if loser.State != "pending_review" {
+		t.Fatalf("losing item must stay pending_review after unique-index rejection, got %s", loser.State)
+	}
+	if loser.CompletedBy != nil || loser.CompletedAt != nil || len(loser.Bindings) != 0 {
+		t.Fatalf("losing item must gain no completion marker or bindings: %#v", loser)
+	}
+	if count := f.bindingCount(t, safeguard.ID); count != 1 {
+		t.Fatalf("the unique index must leave exactly one binding, got %d", count)
+	}
+	if stored, _ := f.items.FindActiveBindings(context.Background(), []uint{safeguard.ID}); len(stored) != 1 || stored[0].ItemID != firstID {
+		t.Fatalf("the surviving binding must belong to the winning item %d", firstID)
 	}
 }
 
